@@ -7,8 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "bot.db"
+import os
+
+DB_PATH = Path(os.getenv("DB_PATH", "/app/storage/bot.db"))
+
 
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
