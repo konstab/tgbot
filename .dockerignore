@@ -1,0 +1,8 @@
+.env
+bot.db
+storage/
+backups/
+__pycache__/
+*.pyc
+.git/
+.venv/

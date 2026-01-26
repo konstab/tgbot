@@ -1,0 +1,16 @@
+services:
+  tgbotnails:
+    build: .
+    container_name: tgbotnails
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./main.py:/app/main.py
+      - ./schedule.py:/app/schedule.py
+      - ./db.py:/app/db.py
+      - ./data.py:/app/data.py
+      - ./config.py:/app/config.py
+      - ./bot.db:/app/bot.db
+      - ./storage:/app/storage
+      - ./backups:/app/backups

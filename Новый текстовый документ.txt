@@ -1,3 +1,0 @@
-pip install -U "python-telegram-bot[job-queue]"
-pip install python-dotenv
-ssh root@45.141.102.104

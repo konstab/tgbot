@@ -21,8 +21,8 @@ PAUSE_MINUTES = 0        # пауза после услуги (мин), если
 DATE_FORMAT = "%d.%m.%Y"  # DD.MM.YYYY
 TIME_FORMAT = "%H:%M"     # HH:MM
 
-DAYS_PER_PAGE = 10
-MASTER_DAYS_PER_PAGE = 10
+DAYS_PER_PAGE = 7
+MASTER_DAYS_PER_PAGE = 7
 
 REMINDERS = {
     "client": {"hours": 24},

@@ -1,0 +1,36 @@
+Все команды выполняй в папке проекта:
+
+cd /home/botuser/tgbotnails
+
+Запуск
+docker compose up -d
+
+Остановить
+docker compose down
+
+
+(контейнер остановится, но bot.db и данные не пропадут, они у тебя лежат на диске и примонтированы)
+
+Перезапуск (самый простой вариант)
+docker compose restart
+
+“Остановить и запустить заново” (жёстче)
+docker compose down
+docker compose up -d
+
+Посмотреть статус
+docker compose ps
+
+Посмотреть логи
+docker logs -f tgbotnails
+
+
+или так:
+
+docker compose logs -f
+
+Если ты поменял код или requirements.txt
+
+Тогда нужен пересбор:
+
+docker compose up -d --build

@@ -1,0 +1,96 @@
+Шаг 1. Подготовка сервера
+1.1 Обновить пакеты
+sudo apt update && sudo apt -y upgrade
+
+1.2 (Рекомендуется) поставить базовые утилиты
+sudo apt -y install ca-certificates curl gnupg nano ufw
+
+========
+1) Создать ключи и добавить репозиторий Docker (по одной команде)
+1.1
+sudo install -m 0755 -d /etc/apt/keyrings
+
+1.2
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+1.3
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+1.4 (это важная команда — одной строкой)
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+1.5
+sudo apt update
+
+2) Установить Docker и compose-плагин
+2.1
+sudo apt -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+2.2 Проверка
+docker --version
+
+2.3 Проверка
+docker compose version
+=============
+Шаг 4. Создаём папку проекта и данные
+4.1
+sudo mkdir -p /opt/tgbotnails/storage /opt/tgbotnails/backups
+
+4.2
+cd /opt/tgbot
+
+Шаг 5. Логинимся в GHCR (приватный образ)
+
+Нужны:
+
+GitHub username (например ваш логин или технический tgbotnails-deploy)
+
+GitHub PAT с правами минимум read:packages (и доступом к репозиторию/пакету)
+
+Команда (вставляйте одной строкой):
+
+docker login ghcr.io -u konstab
+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
+
+Шаг 6. Создаём .env (токен клиента)
+6.1
+nano /opt/tgbotnails/.env
+
+
+Вставьте (пример):
+
+BOT_TOKEN=ВСТАВЬТЕ_ТОКЕН_ОТ_BOTFATHER
+
+
+Сохранить: Ctrl+O, Enter, выйти: Ctrl+X.
+
+6.2 (права на файл)
+chmod 600 /opt/tgbotnails/.env
+
+Шаг 8. Запуск
+8.1 (на всякий случай создадим пустую БД-файл, чтобы volume точно был)
+touch /opt/tgbot/bot.db
+
+1) Чтобы сессия не прерывалась: tmux (самое надёжное)
+1.1 Установить tmux
+sudo apt update && sudo apt -y install tmux
+
+1.2 Запустить сессию
+tmux new -s setup
+
+
+Теперь даже если SSH оборвётся, процессы продолжат работать внутри tmux.
+
+1.3 Как вернуться в сессию после разрыва
+
+Подключились по SSH снова и выполните:
+
+tmux attach -t setup
+
+1.4 Как выйти из tmux, не закрывая процессы
+
+Нажмите: Ctrl+B, затем D.
+
+2.3 На тестовом сервере: залить в GitHub
+Установить git (если нет)
+sudo apt -y install git

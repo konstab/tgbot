@@ -1,0 +1,24 @@
+pip install -U "python-telegram-bot[job-queue]"
+pip install python-dotenv
+ssh root@45.141.102.104
+====================
+apt update && apt -y upgrade
+apt -y install python3 python3-venv python3-pip git ufw
+ufw allow OpenSSH
+ufw enable
+ufw status
+adduser botuser
+usermod -aG sudo botuser
+exit
+ssh botuser@45.141.102.104
+scp -r C:\path\to\project botuser@45.141.102.104:/home/botuser/bot
+git clone https://github.com/konstab/tgbotnails.git
+cd /home/botuser/tgbotnails
+source .venv/bin/activate
+Пароль от сервера: логин botuser ownertgbotlubov
+sudo systemctl restart tgbotnails
+sudo systemctl stop tgbotnails
+sudo systemctl start tgbotnails
+sudo journalctl -u tgbotnails -f
+sudo timedatectl set-timezone Asia/Yakutsk
+source .venv/bin/activate
