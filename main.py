@@ -4813,7 +4813,7 @@ async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for mid, m in all_m.items()
             if master_enabled(mid)
         ]
-        await safe_edit_text(q.message, "Выберите мастера:", InlineKeyboardMarkup(keyboard))
+        await safe_edit_text(q.message, "Выберите мастера!:", InlineKeyboardMarkup(keyboard))
         return
 
     if prev_state == States.SERVICE:
