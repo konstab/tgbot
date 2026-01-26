@@ -982,7 +982,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if master_enabled(mid)
     ]
 
-    await update.message.reply_text("Выберите мастера2:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Выберите мастера:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def choose_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
