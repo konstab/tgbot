@@ -2366,12 +2366,41 @@ async def back_to_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]),
     )
 
-async def show_master_close_day_step(message, offset: int):
+async def show_master_close_day_step(message, master_id: int, offset: int):
     days = get_days_page(offset, days_per_page=MASTER_DAYS_PER_PAGE)
-    keyboard = [[InlineKeyboardButton(d, callback_data=f"choose_block_type_{d}")] for d in days]
-    keyboard.append([InlineKeyboardButton("◀", callback_data="m_prev_days"), InlineKeyboardButton("▶", callback_data="m_next_days")])
+
+    # дни, которые закрыты целиком (time=None)
+    arr = blocked_slots.get(str(master_id), [])
+    fully_blocked = {
+        b.get("date")
+        for b in arr
+        if isinstance(b, dict) and b.get("date") and b.get("time") is None
+    }
+
+    # показываем только дни, которые НЕ закрыты целиком
+    visible_days = [d for d in days if d not in fully_blocked]
+
+    keyboard = []
+
+    # кнопка "мои блокировки" (чтобы можно было открыть/снять блок)
+    keyboard.append([InlineKeyboardButton("📋 Мои блокировки", callback_data="master_blocks")])
+
+    # список доступных дней
+    for d in visible_days:
+        keyboard.append([InlineKeyboardButton(d, callback_data=f"choose_block_type_{d}")])
+
+    keyboard.append([
+        InlineKeyboardButton("◀", callback_data="m_prev_days"),
+        InlineKeyboardButton("▶", callback_data="m_next_days")
+    ])
     keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="back_to_master")])
-    await safe_edit_text(message, "Выберите день для закрытия или редактирования:", InlineKeyboardMarkup(keyboard))
+
+    text = "Выберите день для закрытия или редактирования:"
+    if not visible_days:
+        text += "\n\n(На этой странице все дни уже закрыты целиком — листайте ▶ или откройте «Мои блокировки».)"
+
+    await safe_edit_text(message, text, InlineKeyboardMarkup(keyboard))
+
 
 async def master_close_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2381,7 +2410,7 @@ async def master_close_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard_master(q):
         return
     context.user_data["m_day_offset"] = 0
-    await show_master_close_day_step(q.message, 0)
+    await show_master_close_day_step(q.message, q.from_user.id, 0)
 
 async def master_next_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2393,7 +2422,7 @@ async def master_next_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     offset = context.user_data.get("m_day_offset", 0) + MASTER_DAYS_PER_PAGE
     context.user_data["m_day_offset"] = offset
-    await show_master_close_day_step(q.message, offset)
+    await show_master_close_day_step(q.message, q.from_user.id, offset)
 
 async def master_prev_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2405,7 +2434,7 @@ async def master_prev_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     offset = max(0, context.user_data.get("m_day_offset", 0) - MASTER_DAYS_PER_PAGE)
     context.user_data["m_day_offset"] = offset
-    await show_master_close_day_step(q.message, offset)
+    await show_master_close_day_step(q.message, q.from_user.id, offset)
 
 async def choose_block_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2697,6 +2726,52 @@ async def block_view_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_edit_text(q.message, "\n".join(lines), InlineKeyboardMarkup(keyboard))
 
+async def master_blocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    if not await guard_master(q):
+        return
+
+    master_id = q.from_user.id
+    arr = blocked_slots.get(str(master_id), [])
+
+    # собираем по датам
+    by_date: dict[str, dict] = {}
+    for b in arr:
+        if not isinstance(b, dict):
+            continue
+        d = b.get("date")
+        if not d:
+            continue
+        rec = by_date.setdefault(d, {"day_blocked": False, "times": []})
+        if b.get("time") is None:
+            rec["day_blocked"] = True
+        else:
+            rec["times"].append(str(b.get("time")))
+
+    dates = sorted(by_date.keys())
+
+    if not dates:
+        kb = [
+            [InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")]
+        ]
+        await safe_edit_text(q.message, "Блокировок нет ✅", InlineKeyboardMarkup(kb))
+        return
+
+    keyboard = []
+    for d in dates:
+        rec = by_date[d]
+        if rec["day_blocked"]:
+            label = f"⛔ {d} (день)"
+        else:
+            n = len(set(rec["times"]))
+            label = f"⏰ {d} ({n} сл.)"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"block_view_{d}")])
+
+    keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")])
+    await safe_edit_text(q.message, "📋 Мои блокировки (выберите день):", InlineKeyboardMarkup(keyboard))
 
 async def unblock_day_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -5711,6 +5786,7 @@ def main():
     app.add_handler(CallbackQueryHandler(block_view_day, pattern=r"^block_view_", block=False))
     app.add_handler(CallbackQueryHandler(unblock_day_handler, pattern=r"^unblock_day_", block=False))
     app.add_handler(CallbackQueryHandler(unblock_time_handler, pattern=r"^unblock_time_", block=False))
+    app.add_handler(CallbackQueryHandler(master_blocks, pattern=r"^master_blocks$", block=False))
 
     app.add_handler(CallbackQueryHandler(master_services, pattern=r"^master_services$", block=False))
     app.add_handler(CallbackQueryHandler(svc_manage, pattern=r"^svc_manage_", block=False))
