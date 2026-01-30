@@ -2693,15 +2693,7 @@ async def block_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await _render_block_hours_menu(q.message, q.from_user.id, date_s, sel)
 
-async def block_view_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not await guard_master(q):
-        return
-
-    date = q.data.replace("block_view_", "", 1)  # block_view_YYYY-MM-DD
-    master_id = q.from_user.id
-
+async def _render_block_view_day(message, master_id: int, date: str):
     arr = blocked_slots.get(str(master_id), [])
     day_blocked = any(b.get("date") == date and b.get("time") is None for b in arr)
     times = sorted([b.get("time") for b in arr if b.get("date") == date and b.get("time")])
@@ -2724,7 +2716,18 @@ async def block_view_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("⏰ Закрыть ещё часы", callback_data=f"block_hours_{date}")])
     keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data=f"choose_block_type_{date}")])
 
-    await safe_edit_text(q.message, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+    await safe_edit_text(message, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+
+async def block_view_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not await guard_master(q):
+        return
+
+    date = q.data.replace("block_view_", "", 1)  # block_view_YYYY-MM-DD
+    master_id = q.from_user.id
+
+    await _render_block_view_day(q.message, master_id, date)
 
 async def master_blocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2784,9 +2787,7 @@ async def unblock_day_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await save_blocked_locked()
 
     # показать обновлённый список
-    q.data = f"block_view_{date}"
-    await block_view_day(update, context)
-
+    await _render_block_view_day(q.message, q.from_user.id, date)
 
 async def unblock_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2799,8 +2800,7 @@ async def unblock_time_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     unblock_time(q.from_user.id, date, time)
     await save_blocked_locked()
 
-    q.data = f"block_view_{date}"
-    await block_view_day(update, context)
+    await _render_block_view_day(q.message, q.from_user.id, date)
 
 async def block_apply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
