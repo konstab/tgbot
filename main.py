@@ -1030,6 +1030,7 @@ async def choose_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mprof = ensure_master_profile(master_id)
     about = (mprof.get("about") or "").strip()
     contacts = format_contacts(mprof.get("contacts", {}))
+    photo_id = (mprof.get("photo_file_id") or "").strip()
 
     header = f"👤 {master_data.get('name', master_id)}"
     if about:
@@ -1037,12 +1038,26 @@ async def choose_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if contacts != "—":
         header += f"\nКонтакты:\n{contacts}"
 
+    # ✅ если есть фото — отправим клиенту фото с подписью
+    if photo_id:
+        try:
+            await context.bot.send_photo(
+                chat_id=q.message.chat_id,
+                photo=photo_id,
+                caption=header
+            )
+        except Exception:
+            # если вдруг photo_id битый — просто игнорируем и показываем текстом как раньше
+            pass
+
+    # основное сообщение (которое редактируем) оставляем текстовым, чтобы не ломать safe_edit_text
     await safe_edit_text(
         q.message,
         f"{header}\n\nВыберите услугу:",
         InlineKeyboardMarkup(keyboard),
     )
     return
+
 
 async def choose_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -4627,11 +4642,70 @@ async def master_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("📝 Изменить описание", callback_data="m_edit_about")],
         [InlineKeyboardButton("📞 Контакты", callback_data="m_contacts_menu")],
+        [InlineKeyboardButton("🖼 Фото", callback_data="m_set_photo")],          # ✅ добавили
         [InlineKeyboardButton("🗓 Изменить график", callback_data="m_edit_schedule")],
         [InlineKeyboardButton("⬅ Назад", callback_data="back_to_master")],
     ]
 
     await safe_edit_text(q.message, text, InlineKeyboardMarkup(kb))
+
+async def m_set_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    mid = q.from_user.id
+    if not is_master(mid):
+        return
+
+    # ставим "режим ожидания фото"
+    context.user_data["profile_photo_edit"] = {"mid": mid}
+
+    await safe_edit_text(
+        q.message,
+        "Отправьте ОДНО фото (картинку) следующим сообщением.\n\n"
+        "Чтобы удалить фото — отправьте текст: -"
+    )
+
+
+async def m_receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловим фото от мастера, сохраняем file_id"""
+    user_id = update.effective_user.id
+
+    st = context.user_data.get("profile_photo_edit")
+    if not st:
+        return  # фото не ждали
+
+    mid = st.get("mid")
+    if not mid or user_id != mid:
+        return
+
+    # вариант: мастер хочет удалить фото текстом "-"
+    if update.message and update.message.text and update.message.text.strip() == "-":
+        ensure_master_profile(mid)
+        masters_custom[str(mid)]["photo_file_id"] = ""
+        await save_masters_custom_locked()
+
+        context.user_data.pop("profile_photo_edit", None)
+        await update.message.reply_text("✅ Фото удалено.")
+        return
+
+    # если пришло фото
+    if not update.message or not update.message.photo:
+        await update.message.reply_text("⚠️ Это не фото. Отправьте картинку (или '-' чтобы удалить фото).")
+        return
+
+    # берём самое большое по размеру
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+
+    ensure_master_profile(mid)
+    masters_custom[str(mid)]["photo_file_id"] = file_id
+    await save_masters_custom_locked()
+
+    context.user_data.pop("profile_photo_edit", None)
+    await update.message.reply_text("✅ Фото сохранено. Клиенты будут видеть его при выборе мастера.")
 
 async def m_contacts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -5798,6 +5872,14 @@ def main():
     app.add_handler(CallbackQueryHandler(master_cal_month, pattern=r"^mcal_month_\d{4}-\d{2}$", block=False))
     app.add_handler(CallbackQueryHandler(master_cal_day, pattern=r"^mcal_day_\d{4}-\d{2}-\d{2}$", block=False))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$", block=False))
+    app.add_handler(CallbackQueryHandler(m_set_photo, pattern="^m_set_photo$", block=False))
+
+    # ловим фото/картинку
+    app.add_handler(MessageHandler(filters.PHOTO, m_receive_photo))
+
+    # и на всякий случай ловим текст "-" для удаления, когда мы "ждём фото"
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, m_receive_photo))
+
 
 
     # NEW: rename/delete service handlers (ВАЖНО: app.add_handler, не application.add_handler)
