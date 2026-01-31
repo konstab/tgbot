@@ -167,32 +167,32 @@ async def guard_master(q) -> bool:
 # -----------------------------------------------------------------------------
 # ВСПОМОГАТЕЛЬНОЕ: безопасная отправка/редактирование
 # -----------------------------------------------------------------------------
-async def safe_edit_text(message, text: str, reply_markup=None, retries: int = 3):
-    last_exc = None
-    for attempt in range(retries):
-        try:
-            return await message.edit_text(text=text, reply_markup=reply_markup, parse_mode=None)
-        except telegram.error.BadRequest as e:
-            if "Message is not modified" in str(e):
-                return
-            raise
-        except telegram.error.TimedOut as e:
-            last_exc = e
-            await asyncio.sleep(1.0 * (attempt + 1))
-        except telegram.error.NetworkError as e:
-            last_exc = e
-            await asyncio.sleep(1.0 * (attempt + 1))
-
-    # если после ретраев не вышло — можно НЕ падать, а просто отправить новое сообщение (fallback)
+async def safe_edit_text(message, text, reply_markup=None):
+    """
+    Универсально редактирует:
+    - обычные текстовые сообщения через edit_text
+    - медиа-сообщения (фото/видео/док) через edit_caption
+    Если отредактировать нельзя — отправляет новое сообщение.
+    """
     try:
-        bot = message.get_bot()
-        return await bot.send_message(chat_id=message.chat_id, text=text, reply_markup=reply_markup)
-    except Exception:
-        # уже совсем без шансов — пробрасываем последнюю
-        if last_exc:
-            raise last_exc
-        raise
+        # 1) обычное текстовое сообщение
+        if getattr(message, "text", None) is not None:
+            return await message.edit_text(text=text, reply_markup=reply_markup, parse_mode=None)
 
+        # 2) фото/медиа сообщение — редактируем подпись (caption)
+        # Telegram допускает caption даже если ранее ее не было
+        if getattr(message, "caption", None) is not None or getattr(message, "photo", None) or getattr(message, "video", None) or getattr(message, "document", None):
+            return await message.edit_caption(caption=text, reply_markup=reply_markup, parse_mode=None)
+
+        # 3) если не понятно что это — просто шлём новое
+        return await message.get_bot().send_message(chat_id=message.chat_id, text=text, reply_markup=reply_markup)
+
+    except Exception:
+        # если редактирование невозможно (например сообщение старое/удалено) — шлём новое
+        try:
+            return await message.get_bot().send_message(chat_id=message.chat_id, text=text, reply_markup=reply_markup)
+        except Exception:
+            return None
 
 async def safe_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
     try:
