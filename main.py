@@ -2412,6 +2412,8 @@ async def show_master_close_day_step(message, master_id: int, offset: int):
 
     # кнопка "мои блокировки" (чтобы можно было открыть/снять блок)
     keyboard.append([InlineKeyboardButton("📋 Мои блокировки", callback_data="master_blocks")])
+    keyboard.append([InlineKeyboardButton("📅 Заблокировать период", callback_data="block_period")])
+
 
     # список доступных дней
     for d in visible_days:
@@ -2429,6 +2431,188 @@ async def show_master_close_day_step(message, master_id: int, offset: int):
 
     await safe_edit_text(message, text, InlineKeyboardMarkup(keyboard))
 
+async def _render_block_period(message, master_id: int, offset: int, step: str, start_date: str | None):
+    """
+    step: "start" или "end"
+    start_date: строка DATE_FORMAT, когда step="end"
+    """
+    days = get_days_page(offset, days_per_page=MASTER_DAYS_PER_PAGE)
+
+    # если выбираем конец — нельзя выбрать дату раньше старта
+    if step == "end" and start_date:
+        try:
+            sd = datetime.strptime(start_date, DATE_FORMAT).date()
+        except Exception:
+            sd = None
+
+        if sd:
+            filtered = []
+            for d in days:
+                try:
+                    dd = datetime.strptime(d, DATE_FORMAT).date()
+                except Exception:
+                    continue
+                if dd >= sd:
+                    filtered.append(d)
+            days = filtered
+
+    keyboard = []
+    for d in days:
+        keyboard.append([InlineKeyboardButton(d, callback_data=f"bp_pick_{d}")])
+
+    keyboard.append([
+        InlineKeyboardButton("◀", callback_data="bp_prev"),
+        InlineKeyboardButton("▶", callback_data="bp_next"),
+    ])
+    keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")])
+
+    if step == "start":
+        text = "📅 Блокировка периода\n\nВыберите ДАТУ НАЧАЛА:"
+    else:
+        text = f"📅 Блокировка периода\n\nДата начала: {start_date}\nВыберите ДАТУ КОНЦА:"
+
+    # подсказка, если на странице нет доступных дат (например, фильтр по start_date всё вырезал)
+    if not days:
+        text += "\n\n(На этой странице нет подходящих дат — нажмите ▶)"
+
+    await safe_edit_text(message, text, InlineKeyboardMarkup(keyboard))
+
+
+async def block_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    if not await guard_master(q):
+        return
+
+    context.user_data["block_period"] = {"step": "start", "offset": 0, "start": None}
+    await _render_block_period(q.message, q.from_user.id, 0, "start", None)
+
+
+async def bp_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    if not await guard_master(q):
+        return
+
+    st = context.user_data.get("block_period")
+    if not isinstance(st, dict):
+        return
+
+    st["offset"] = int(st.get("offset", 0)) + MASTER_DAYS_PER_PAGE
+    await _render_block_period(q.message, q.from_user.id, st["offset"], st.get("step", "start"), st.get("start"))
+
+
+async def bp_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    if not await guard_master(q):
+        return
+
+    st = context.user_data.get("block_period")
+    if not isinstance(st, dict):
+        return
+
+    st["offset"] = max(0, int(st.get("offset", 0)) - MASTER_DAYS_PER_PAGE)
+    await _render_block_period(q.message, q.from_user.id, st["offset"], st.get("step", "start"), st.get("start"))
+
+
+async def bp_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    if not await guard_master(q):
+        return
+
+    st = context.user_data.get("block_period")
+    if not isinstance(st, dict):
+        return
+
+    date_s = q.data.replace("bp_pick_", "", 1)
+
+    # валидируем дату
+    try:
+        picked = datetime.strptime(date_s, DATE_FORMAT).date()
+    except Exception:
+        await q.answer("Некорректная дата", show_alert=True)
+        return
+
+    # шаг 1: выбираем старт
+    if st.get("step") == "start":
+        st["start"] = date_s
+        st["step"] = "end"
+        st["offset"] = 0
+        await _render_block_period(q.message, q.from_user.id, 0, "end", date_s)
+        return
+
+    # шаг 2: выбираем конец и закрываем диапазон
+    start_s = st.get("start")
+    if not start_s:
+        # на всякий случай сброс
+        context.user_data.pop("block_period", None)
+        await safe_edit_text(q.message, "Ошибка состояния. Попробуйте ещё раз.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("📅 Заблокировать период", callback_data="block_period")],
+            [InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")]
+        ]))
+        return
+
+    try:
+        start_d = datetime.strptime(start_s, DATE_FORMAT).date()
+    except Exception:
+        await q.answer("Некорректная дата начала", show_alert=True)
+        return
+
+    end_d = picked
+    if end_d < start_d:
+        await q.answer("Конец раньше начала", show_alert=True)
+        return
+
+    # блокируем все дни
+    cur = start_d
+    count = 0
+    while cur <= end_d:
+        ds = cur.strftime(DATE_FORMAT)
+        block_slot(q.from_user.id, ds, time=None)   # как в block_day :contentReference[oaicite:3]{index=3}
+        count += 1
+        cur += timedelta(days=1)
+
+    await save_blocked_locked()
+
+    context.user_data.pop("block_period", None)
+    await safe_edit_text(
+        q.message,
+        f"✅ Период закрыт.\n"
+        f"📅 {start_s} — {date_s}\n"
+        f"Дней закрыто: {count}",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Мои блокировки", callback_data="master_blocks")],
+            [InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")],
+        ])
+    )
+
+async def block_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    if not await guard_master(q):
+        return
+
+    kb = [
+        [InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")],
+    ]
+    await safe_edit_text(
+        q.message,
+        "📅 Блокировка периода — в разработке.\n"
+        "Следующим шагом сделаем выбор даты начала и конца.",
+        InlineKeyboardMarkup(kb),
+    )
 
 async def master_close_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -5886,6 +6070,11 @@ def main():
     app.add_handler(CallbackQueryHandler(master_cal_day, pattern=r"^mcal_day_\d{4}-\d{2}-\d{2}$", block=False))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$", block=False))
     app.add_handler(CallbackQueryHandler(m_set_photo, pattern="^m_set_photo$", block=False))
+    app.add_handler(CallbackQueryHandler(block_period, pattern=r"^block_period$", block=False))
+    app.add_handler(CallbackQueryHandler(block_period, pattern=r"^block_period$", block=False))
+    app.add_handler(CallbackQueryHandler(bp_next, pattern=r"^bp_next$", block=False))
+    app.add_handler(CallbackQueryHandler(bp_prev, pattern=r"^bp_prev$", block=False))
+    app.add_handler(CallbackQueryHandler(bp_pick, pattern=r"^bp_pick_", block=False))
 
     # ловим фото/картинку
     app.add_handler(MessageHandler(filters.PHOTO, m_receive_photo))
