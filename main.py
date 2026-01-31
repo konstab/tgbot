@@ -677,16 +677,28 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     if not booking or booking.get("status") != "CONFIRMED":
         return
 
+    reply_markup = None
+
     if target == "client":
         chat_id = booking["client_id"]
         addr = get_master_address(booking["master_id"])
+
         text = (
             "⏰ Напоминание о записи!\n\n"
             f"📅 {booking['date']}\n"
             f"⏰ {booking['time']}\n"
-            f"💅 {booking['service_name']}"
+            f"💅 {booking['service_name']}\n"
             f"📍 Адрес: {addr}\n"
         )
+
+        # кнопки подтверждения/отмены
+        reply_markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Я приду", callback_data=f"remind_yes_{booking_id}"),
+                InlineKeyboardButton("❌ Отменить / Перенести", callback_data=f"client_cancel_{booking_id}"),
+            ]
+        ])
+
     else:
         chat_id = booking["master_id"]
         text = (
@@ -698,9 +710,72 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         )
 
     try:
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
     except Exception as e:
         print(f"[REMINDER ERROR] booking_id={booking_id} target={target} chat_id={chat_id} err={e}")
+
+async def remind_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    # remind_yes_<booking_id>
+    parts = (q.data or "").split("_")
+    if len(parts) < 3:
+        return
+
+    try:
+        booking_id = int(parts[2])
+    except Exception:
+        return
+
+    booking = get_booking(booking_id)
+    if not booking:
+        await q.answer("Запись не найдена", show_alert=True)
+        return
+
+    # защита: нажимать может только клиент этой записи
+    if q.from_user.id != booking.get("client_id"):
+        await q.answer("Нет доступа", show_alert=True)
+        return
+
+    # защита от повторных нажатий
+    if booking.get("client_confirmed") is True:
+        await q.answer("Вы уже подтвердили ✅", show_alert=True)
+        return
+
+    booking["client_confirmed"] = True
+    booking["client_confirmed_at"] = datetime.now().isoformat(timespec="seconds")
+    await save_bookings_locked()
+
+    # уведомляем мастера
+    try:
+        await context.bot.send_message(
+            chat_id=booking["master_id"],
+            text=(
+                "✅ Клиент подтвердил запись (нажал «Я приду»)\n\n"
+                f"👤 Клиент: {format_client(booking)}\n"
+                f"📅 {booking.get('date')}\n"
+                f"⏰ {booking.get('time')}\n"
+                f"💅 {booking.get('service_name')}\n"
+                f"🆔 Запись: #{booking_id}"
+            ),
+        )
+    except Exception:
+        pass
+
+    # обновим сообщение клиенту и уберём кнопки
+    new_text = (q.message.text or "").strip()
+    if new_text:
+        new_text += "\n\n✅ Отмечено: вы придёте."
+        await safe_edit_text(q.message, new_text, reply_markup=None)
+    else:
+        # на всякий случай (если вдруг нет текста)
+        await context.bot.send_message(
+            chat_id=booking["client_id"],
+            text="✅ Отмечено: вы придёте.",
+        )
 
 def remove_reminders(job_queue: JobQueue, booking_id: int):
     for name in (f"client_{booking_id}", f"master_{booking_id}", f"expire_{booking_id}", f"followup_{booking_id}"):
@@ -6059,6 +6134,7 @@ def main():
     app.add_handler(CallbackQueryHandler(nearest_times, pattern=r"^nearest_times$", block=False))
     app.add_handler(CallbackQueryHandler(nearest_back, pattern=r"^nearest_back$", block=False))
     app.add_handler(CallbackQueryHandler(nearest_pick, pattern=r"^nearest_pick_", block=False))
+    app.add_handler(CallbackQueryHandler(remind_yes, pattern=r"^remind_yes_\d+$", block=False))
 
 
     # chat + text router
