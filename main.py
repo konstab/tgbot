@@ -2596,24 +2596,6 @@ async def bp_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
-async def block_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q:
-        return
-    await q.answer()
-    if not await guard_master(q):
-        return
-
-    kb = [
-        [InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")],
-    ]
-    await safe_edit_text(
-        q.message,
-        "📅 Блокировка периода — в разработке.\n"
-        "Следующим шагом сделаем выбор даты начала и конца.",
-        InlineKeyboardMarkup(kb),
-    )
-
 async def master_close_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
