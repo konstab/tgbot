@@ -127,6 +127,10 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_users_active ON users(active);
             """
         )
+        try:
+            conn.execute("ALTER TABLE masters ADD COLUMN photo_file_id TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -162,6 +166,7 @@ def load_state() -> Dict[str, Any]:
                 "about": r["about"],
                 "contacts": _jl(r["contacts_json"], {}),
                 "schedule": _jl(r["schedule_json"], {}),
+                "photo_file_id": (r["photo_file_id"] or ""),
                 "services": [],
             }
 
@@ -300,10 +305,13 @@ def save_state(
             contacts = m.get("contacts") if isinstance(m.get("contacts"), dict) else {}
             schedule = m.get("schedule") if isinstance(m.get("schedule"), dict) else {}
 
+            photo_file_id = str(m.get("photo_file_id") or "")
+
             cur.execute(
-                "INSERT INTO masters(master_id, name, enabled, about, contacts_json, schedule_json) VALUES(?, ?, ?, ?, ?, ?)",
-                (mid, name, enabled, about, _j(contacts), _j(schedule)),
+                "INSERT INTO masters(master_id, name, enabled, about, contacts_json, schedule_json, photo_file_id) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (mid, name, enabled, about, _j(contacts), _j(schedule), photo_file_id),
             )
+
             inserted_master_ids.add(mid)
 
             base_services = m.get("services", [])

@@ -399,6 +399,43 @@ def get_days_page(offset: int, days_per_page: int = DAYS_PER_PAGE) -> list[str]:
     start = today + timedelta(days=offset)
     return [(start + timedelta(days=i)).strftime(DATE_FORMAT) for i in range(days_per_page)]
 
+def scan_available_days(master_id: int, start_offset: int, svc_ids, limit: int = DAYS_PER_PAGE, scan_cap: int = 365 * 2):
+    """
+    Возвращает (available_days, end_offset).
+    available_days — ближайшие limit дней, где есть свободные слоты.
+    end_offset — смещение (offset), на котором закончился скан (последний проверенный день).
+    """
+    today = datetime.now().date()
+    master_blocked = blocked_slots.get(str(master_id), [])
+
+    available = []
+    offset = start_offset
+    scanned = 0
+
+    while len(available) < limit and scanned < scan_cap:
+        d = (today + timedelta(days=offset)).strftime(DATE_FORMAT)
+
+        # день закрыт целиком
+        if any(b.get("date") == d and b.get("time") is None for b in master_blocked):
+            offset += 1
+            scanned += 1
+            continue
+
+        try:
+            slots = get_available_slots(master_id, d, svc_ids)
+        except Exception:
+            slots = []
+
+        if slots:
+            available.append(d)
+
+        offset += 1
+        scanned += 1
+
+    end_offset = offset - 1
+    return available, end_offset
+
+
 def get_next_days(n=100) -> list[str]:
     today = datetime.now().date()
     return [(today + timedelta(days=i)).strftime(DATE_FORMAT) for i in range(n)]
@@ -1182,44 +1219,29 @@ async def choose_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_edit_text(q.message, f"{header}\n\nВыберите услугу(и):{footer}", InlineKeyboardMarkup(keyboard))
 
-
 async def show_date_step(message, ctx: dict):
     ctx["state"] = States.DATE
-    offset = ctx.get("day_offset", 0)
 
     master_id = ctx.get("master_id")
     service_id = ctx.get("service_id")
-
     if not master_id or not service_id:
         await safe_edit_text(message, "Контекст утерян. Начните заново: /start")
         return
 
-    days = get_days_page(offset)
-    master_blocked = blocked_slots.get(str(master_id), [])
+    offset = int(ctx.get("day_offset", 0))
 
-    def _calc_available_days():
-        available = []
-        for d in days:
-            # день закрыт целиком
-            if any(b.get("date") == d and b.get("time") is None for b in master_blocked):
-                continue
+    def _calc():
+        svc_ids = ctx.get("service_ids") or ctx.get("service_id")
+        return scan_available_days(master_id, offset, svc_ids, limit=DAYS_PER_PAGE)
 
-            try:
-                svc_ids = ctx.get("service_ids") or ctx.get("service_id")
-                slots = get_available_slots(master_id, d, svc_ids)
+    # ✅ тяжёлое — в поток
+    available_days, end_offset = await asyncio.to_thread(_calc)
 
-            except Exception:
-                slots = []
-
-            if slots:
-                available.append(d)
-        return available
-
-    # ✅ самое тяжёлое — в поток
-    available_days = await asyncio.to_thread(_calc_available_days)
+    ctx["day_end_offset"] = end_offset  # понадобится для ▶
 
     keyboard = [[InlineKeyboardButton(d, callback_data=f"date_{d}")] for d in available_days]
     keyboard.insert(0, [InlineKeyboardButton("⚡ Ближайшее время", callback_data="nearest_times")])
+
     keyboard.append([
         InlineKeyboardButton("◀", callback_data="prev_days"),
         InlineKeyboardButton("▶", callback_data="next_days"),
@@ -1228,7 +1250,7 @@ async def show_date_step(message, ctx: dict):
 
     text = "📅 Выберите дату:"
     if not available_days:
-        text += "\n\n(На этой странице нет свободных дней — нажмите ▶)"
+        text += "\n\nСвободных дней не найдено. Попробуйте позже или выберите другого мастера."
 
     await safe_edit_text(message, text, InlineKeyboardMarkup(keyboard))
 
@@ -1239,8 +1261,23 @@ async def next_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ctx = user_context.get(q.from_user.id)
     if not ctx:
         return
-    ctx["day_offset"] = ctx.get("day_offset", 0) + DAYS_PER_PAGE
+
+    # история для кнопки "◀"
+    hist = ctx.get("day_offset_hist")
+    if not isinstance(hist, list):
+        hist = []
+        ctx["day_offset_hist"] = hist
+
+    hist.append(ctx.get("day_offset", 0))
+
+    # прыгаем на следующий день после последнего проверенного
+    end_offset = ctx.get("day_end_offset")
+    if end_offset is None:
+        end_offset = ctx.get("day_offset", 0)
+
+    ctx["day_offset"] = int(end_offset) + 1
     await show_date_step(q.message, ctx)
+
 
 async def prev_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1248,7 +1285,13 @@ async def prev_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ctx = user_context.get(q.from_user.id)
     if not ctx:
         return
-    ctx["day_offset"] = max(0, ctx.get("day_offset", 0) - DAYS_PER_PAGE)
+
+    hist = ctx.get("day_offset_hist")
+    if not isinstance(hist, list) or not hist:
+        ctx["day_offset"] = 0
+    else:
+        ctx["day_offset"] = hist.pop()
+
     await show_date_step(q.message, ctx)
 
 async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2125,23 +2168,18 @@ async def client_resched_show_date(message, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_text(message, "Запись не найдена.")
         return
 
-    offset = st.get("offset", 0)
-    days = get_days_page(offset)
+    offset = int(st.get("offset", 0))
 
-    # показываем только дни, где есть свободные слоты по этой услуге
-    available_days = []
-    for d in days:
-        try:
-            svc_ids = booking.get("service_ids") or booking["service_id"]
-            slots = await asyncio.to_thread(get_available_slots, booking["master_id"], d, svc_ids)
-        except Exception:
-            slots = []
-        if slots:
-            available_days.append(d)
+    def _calc():
+        svc_ids = booking.get("service_ids") or booking["service_id"]
+        return scan_available_days(booking["master_id"], offset, svc_ids, limit=DAYS_PER_PAGE)
+
+    available_days, end_offset = await asyncio.to_thread(_calc)
+
+    st["end_offset"] = end_offset
 
     kb = [[InlineKeyboardButton(d, callback_data=f"client_resched_date_{d}")] for d in available_days]
 
-    # навигация всегда показывается, даже если текущая страница пустая
     kb.append([
         InlineKeyboardButton("◀", callback_data="client_resched_prev"),
         InlineKeyboardButton("▶", callback_data="client_resched_next"),
@@ -2151,34 +2189,54 @@ async def client_resched_show_date(message, context: ContextTypes.DEFAULT_TYPE):
     if not available_days:
         await safe_edit_text(
             message,
-            "На этой странице нет свободных дней. Нажмите ▶ чтобы посмотреть дальше.",
+            "Свободных дней не найдено. Попробуйте позже или выберите отмену записи.",
             InlineKeyboardMarkup(kb),
         )
         return
 
     await safe_edit_text(message, "Выберите новую дату:", InlineKeyboardMarkup(kb))
 
-
 async def client_resched_next_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
     await q.answer()
+
     st = context.user_data.get("client_resched")
     if not st:
         return
-    st["offset"] = st.get("offset", 0) + DAYS_PER_PAGE
+
+    hist = st.get("offset_hist")
+    if not isinstance(hist, list):
+        hist = []
+        st["offset_hist"] = hist
+
+    hist.append(int(st.get("offset", 0)))
+
+    end_offset = st.get("end_offset")
+    if end_offset is None:
+        end_offset = int(st.get("offset", 0))
+
+    st["offset"] = int(end_offset) + 1
     await client_resched_show_date(q.message, context)
+
 
 async def client_resched_prev_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
     await q.answer()
+
     st = context.user_data.get("client_resched")
     if not st:
         return
-    st["offset"] = max(0, st.get("offset", 0) - DAYS_PER_PAGE)
+
+    hist = st.get("offset_hist")
+    if isinstance(hist, list) and hist:
+        st["offset"] = hist.pop()
+    else:
+        st["offset"] = 0
+
     await client_resched_show_date(q.message, context)
 
 async def client_resched_choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
