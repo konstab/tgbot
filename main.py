@@ -2714,7 +2714,7 @@ async def _render_block_view_day(message, master_id: int, date: str):
         keyboard.append([InlineKeyboardButton(f"❌ Открыть {t}", callback_data=f"unblock_time_{date}_{t}")])
 
     keyboard.append([InlineKeyboardButton("⏰ Закрыть ещё часы", callback_data=f"block_hours_{date}")])
-    keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data=f"choose_block_type_{date}")])
+    keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="master_blocks")])
 
     await safe_edit_text(message, "\n".join(lines), InlineKeyboardMarkup(keyboard))
 
