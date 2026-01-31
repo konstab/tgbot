@@ -1038,26 +1038,39 @@ async def choose_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if contacts != "—":
         header += f"\nКонтакты:\n{contacts}"
 
-    # ✅ если есть фото — отправим клиенту фото с подписью
+    text = f"{header}\n\nВыберите услугу:"
+    markup = InlineKeyboardMarkup(keyboard)
+
+    # ✅ Если есть фото — удаляем старое сообщение и отправляем новое с фото+кнопками
     if photo_id:
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+
         try:
             await context.bot.send_photo(
                 chat_id=q.message.chat_id,
                 photo=photo_id,
-                caption=header
+                caption=text,
+                reply_markup=markup,
             )
         except Exception:
-            # если вдруг photo_id битый — просто игнорируем и показываем текстом как раньше
-            pass
+            # если фото битое/недоступное — просто покажем текстом
+            await context.bot.send_message(
+                chat_id=q.message.chat_id,
+                text=text,
+                reply_markup=markup,
+            )
+        return
 
-    # основное сообщение (которое редактируем) оставляем текстовым, чтобы не ломать safe_edit_text
+    # ✅ Если фото нет — работаем как раньше (редактируем текущее сообщение)
     await safe_edit_text(
         q.message,
-        f"{header}\n\nВыберите услугу:",
-        InlineKeyboardMarkup(keyboard),
+        text,
+        markup,
     )
     return
-
 
 async def choose_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
