@@ -1,9 +1,8 @@
 from db import get_db, init_db, upsert_user
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone, time as dtime
 import calendar
 import asyncio
 import logging
-from datetime import datetime, timedelta
 import data
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -400,6 +399,14 @@ def get_days_page(offset: int, days_per_page: int = DAYS_PER_PAGE) -> list[str]:
     return [(start + timedelta(days=i)).strftime(DATE_FORMAT) for i in range(days_per_page)]
 
 def scan_available_days(master_id: int, start_offset: int, svc_ids, limit: int = DAYS_PER_PAGE, scan_cap: int = 365 * 2):
+    # ✅ нормализация svc_ids
+    if svc_ids is None:
+        svc_ids = []
+    if isinstance(svc_ids, int):
+        svc_ids = [svc_ids]
+    if isinstance(svc_ids, str) and svc_ids.isdigit():
+        svc_ids = [int(svc_ids)]
+
     """
     Возвращает (available_days, end_offset).
     available_days — ближайшие limit дней, где есть свободные слоты.
@@ -456,9 +463,6 @@ def format_client(booking: dict) -> str:
     if name:
         return f"{name} (ID: {booking.get('client_id')})"
     return f"ID: {booking.get('client_id')}"
-
-
-
 
 def _normalize_phone(raw: str) -> str:
     s = (raw or "").strip()
@@ -655,6 +659,23 @@ def unblock_time(master_id: int, date: str, time: str):
 # -----------------------------------------------------------------------------
 # НАПОМИНАНИЯ
 # -----------------------------------------------------------------------------
+# --- Повторные напоминания клиенту ---
+# "за сколько часов ДО сеанса" слать повторные напоминания, если клиент не ответил
+CLIENT_REPEAT_BEFORE_HOURS = [12, 3]
+
+def _client_repeat_job_name(booking_id: int, idx: int) -> str:
+    return f"client_rep{idx}_{booking_id}"
+
+def remove_client_reminder_jobs(job_queue, booking_id: int):
+    """Удаляем только клиентские напоминания по записи: основное + повторы."""
+    names = [f"client_{booking_id}"]
+    for idx in range(1, len(CLIENT_REPEAT_BEFORE_HOURS) + 1):
+        names.append(_client_repeat_job_name(booking_id, idx))
+
+    for name in names:
+        for job in job_queue.get_jobs_by_name(name):
+            job.schedule_removal()
+
 def get_reminders_cfg():
     try:
         r = ADMIN_SETTINGS.get("reminders", {})
@@ -665,17 +686,69 @@ def get_reminders_cfg():
     except Exception:
         return REMINDERS
 
+async def send_master_tomorrow_digest(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Каждый день шлём мастеру список записей на завтра.
+    """
+    tomorrow = (datetime.now().date() + timedelta(days=1)).strftime(DATE_FORMAT)
+
+    # сгруппируем по мастерам
+    by_master = {}
+    for b in bookings:
+        if b.get("status") != "CONFIRMED":
+            continue
+        if b.get("date") != tomorrow:
+            continue
+        mid = b.get("master_id")
+        if not mid:
+            continue
+        by_master.setdefault(mid, []).append(b)
+
+    # отправим каждому мастеру
+    for mid, items in by_master.items():
+        # сортировка по времени
+        items.sort(key=lambda x: x.get("time") or "")
+
+        lines = []
+        for b in items:
+            lines.append(
+                st = "✅ подтвердил" if b.get("client_confirmed") is True else "⏳ ответа нет"
+                lines.append(
+                    f"⏰ {b.get('time')} — {b.get('service_name')}\n"
+                    f"👤 {format_client(b)}\n"
+                    f"Статус: {st}\n"
+                    f"🆔 #{b.get('id') or b.get('booking_id', '')}".strip()
+                )
+            )
+
+        text = "📌 Записи на завтра:\n\n" + "\n\n".join(lines)
+
+        try:
+            await context.bot.send_message(chat_id=mid, text=text)
+        except Exception:
+            pass
+
 def reminder_delta(cfg: dict) -> timedelta:
     return timedelta(**cfg)
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
-    booking_id = job.data["booking_id"]
-    target = job.data["target"]
+    data = job.data or {}
+    booking_id = data.get("booking_id")
+    target = data.get("target")
+    kind = data.get("kind", "auto")  # auto / repeat1 / repeat2 / manual
+
+    if booking_id is None or target is None:
+        return
 
     booking = get_booking(booking_id)
     if not booking or booking.get("status") != "CONFIRMED":
         return
+
+    # Любые клиентские напоминания не шлём, если клиент уже отреагировал
+    if target == "client":
+        if booking.get("client_confirmed") is True or booking.get("client_reminder_responded") is True:
+            return
 
     reply_markup = None
 
@@ -683,22 +756,26 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         chat_id = booking["client_id"]
         addr = get_master_address(booking["master_id"])
 
+        title = "⏰ Напоминание о записи!"
+        if str(kind).startswith("repeat"):
+            title = "🔔 Повторное напоминание о записи!"
+        if kind == "manual":
+            title = "📨 Напоминание от мастера!"
+
         text = (
-            "⏰ Напоминание о записи!\n\n"
+            f"{title}\n\n"
             f"📅 {booking['date']}\n"
             f"⏰ {booking['time']}\n"
             f"💅 {booking['service_name']}\n"
             f"📍 Адрес: {addr}\n"
         )
 
-        # кнопки подтверждения/отмены
         reply_markup = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Я приду", callback_data=f"remind_yes_{booking_id}"),
                 InlineKeyboardButton("❌ Отменить / Перенести", callback_data=f"client_cancel_{booking_id}"),
             ]
         ])
-
     else:
         chat_id = booking["master_id"]
         text = (
@@ -713,6 +790,40 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
     except Exception as e:
         print(f"[REMINDER ERROR] booking_id={booking_id} target={target} chat_id={chat_id} err={e}")
+        return
+
+    # фиксируем факт отправки (для статуса мастеру)
+    if target == "client":
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        booking["client_reminder_last_sent_at"] = now_iso
+        booking["client_reminder_last_kind"] = str(kind)
+
+        if not booking.get("client_reminder_first_sent_at"):
+            booking["client_reminder_first_sent_at"] = now_iso
+
+        try:
+            booking["client_reminder_sent_count"] = int(booking.get("client_reminder_sent_count") or 0) + 1
+        except Exception:
+            booking["client_reminder_sent_count"] = 1
+
+        await save_bookings_locked()
+
+        # мастера уведомляем только о первом авто и ручном, чтобы не спамить повторами
+        if kind in ("auto", "manual"):
+            try:
+                await context.bot.send_message(
+                    chat_id=booking["master_id"],
+                    text=(
+                        "📨 Напоминание отправлено клиенту.\n"
+                        "Статус: ⏳ ответа пока нет.\n\n"
+                        f"🆔 Запись: #{booking_id}\n"
+                        f"👤 Клиент: {format_client(booking)}\n"
+                        f"📅 {booking.get('date')} {booking.get('time')}\n"
+                        f"💅 {booking.get('service_name')}"
+                    ),
+                )
+            except Exception:
+                pass
 
 async def remind_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -748,6 +859,13 @@ async def remind_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     booking["client_confirmed"] = True
     booking["client_confirmed_at"] = datetime.now().isoformat(timespec="seconds")
     await save_bookings_locked()
+    booking["client_reminder_responded"] = True
+    booking["client_reminder_response"] = "yes"
+    booking["client_reminder_responded_at"] = datetime.now().isoformat(timespec="seconds")
+    await save_bookings_locked()
+
+    # повторы/клиентские напоминания больше не нужны
+    remove_client_reminder_jobs(context.job_queue, booking_id)
 
     # уведомляем мастера
     try:
@@ -777,8 +895,52 @@ async def remind_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="✅ Отмечено: вы придёте.",
         )
 
-def remove_reminders(job_queue: JobQueue, booking_id: int):
-    for name in (f"client_{booking_id}", f"master_{booking_id}", f"expire_{booking_id}", f"followup_{booking_id}"):
+async def master_send_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+
+    await q.answer()
+
+    if not await guard_master(q):
+        return
+
+    try:
+        booking_id = int(q.data.rsplit("_", 1)[1])
+    except Exception:
+        await q.answer("Ошибка кнопки", show_alert=True)
+        return
+
+    booking = get_booking(booking_id)
+    if not booking or booking.get("status") != "CONFIRMED":
+        await q.answer("Запись не найдена", show_alert=True)
+        return
+
+    if booking.get("master_id") != q.from_user.id:
+        await q.answer("Нет доступа", show_alert=True)
+        return
+
+    # если клиент уже ответил — не надо
+    if booking.get("client_confirmed") is True or booking.get("client_reminder_responded") is True:
+        await q.answer("Клиент уже ответил ✅", show_alert=True)
+        return
+
+    # шлём как kind=manual через send_reminder
+    fake = type("obj", (), {})()
+    fake.data = {"booking_id": booking_id, "target": "client", "kind": "manual"}
+    context.job = fake
+    await send_reminder(context)
+
+    await q.answer("Отправлено ✅")
+
+def remove_reminders(job_queue, booking_id: int):
+    """
+    Удаляем напоминания (client/master/expire) + повторы клиенту.
+    followup (оценка) не трогаем здесь, чтобы случайно не снести.
+    """
+    remove_client_reminder_jobs(job_queue, booking_id)
+
+    for name in (f"master_{booking_id}", f"expire_{booking_id}"):
         for job in job_queue.get_jobs_by_name(name):
             job.schedule_removal()
 
@@ -801,6 +963,23 @@ def schedule_reminders_for_booking(job_queue: JobQueue, booking: dict):
             data={"booking_id": booking_id, "target": "client"},
             name=f"client_{booking_id}",
         )
+    # --- Повторы клиенту (если он не ответил) ---
+    base_before_sec = reminder_delta(rcfg["client"]).total_seconds()
+
+    for idx, hours_before in enumerate(CLIENT_REPEAT_BEFORE_HOURS, start=1):
+        # повторы должны быть "ближе к сеансу", чем основное напоминание
+        if hours_before * 3600 >= base_before_sec:
+            continue
+
+        repeat_delay = (booking_dt - timedelta(hours=hours_before) - now).total_seconds()
+        if repeat_delay > 0:
+            job_queue.run_once(
+                send_reminder,
+                when=repeat_delay,
+                data={"booking_id": booking_id, "target": "client", "kind": f"repeat{idx}"},
+                name=_client_repeat_job_name(booking_id, idx),
+            )
+
 
     master_delay = (booking_dt - reminder_delta(rcfg["master"]) - now).total_seconds()
     if master_delay > 0:
@@ -812,36 +991,14 @@ def schedule_reminders_for_booking(job_queue: JobQueue, booking: dict):
         )
 
 def restore_reminders(job_queue: JobQueue):
-    now = datetime.now()
-    rcfg = get_reminders_cfg()
-
+    """
+    Восстанавливаем все напоминания после перезапуска.
+    Единственный источник правды — schedule_reminders_for_booking().
+    """
     for booking in bookings:
         if booking.get("status") != "CONFIRMED":
             continue
-
-        try:
-            booking_dt = datetime.strptime(f"{booking['date']} {booking['time']}", f"{DATE_FORMAT} {TIME_FORMAT}")
-        except Exception:
-            continue
-
-        client_delay = (booking_dt - reminder_delta(rcfg["client"]) - now).total_seconds()
-        if client_delay > 0:
-            remove_reminders(job_queue, booking["id"])
-            job_queue.run_once(
-                send_reminder,
-                when=client_delay,
-                data={"booking_id": booking["id"], "target": "client"},
-                name=f"client_{booking['id']}",
-            )
-
-        master_delay = (booking_dt - reminder_delta(rcfg["master"]) - now).total_seconds()
-        if master_delay > 0:
-            job_queue.run_once(
-                send_reminder,
-                when=master_delay,
-                data={"booking_id": booking["id"], "target": "master"},
-                name=f"master_{booking['id']}",
-            )
+        schedule_reminders_for_booking(job_queue, booking)
 
 def restore_followups(job_queue: JobQueue):
     """
@@ -2127,19 +2284,40 @@ async def client_cancel_choose(update: Update, context: ContextTypes.DEFAULT_TYP
     q = update.callback_query
     if not q:
         return
-    await q.answer()
 
-    parts = q.data.split("_")
-    booking_id = int(parts[3])
+    parts = (q.data or "").split("_")
+    if len(parts) < 5:
+        await q.answer("Ошибка кнопки", show_alert=True)
+        return
+
+    try:
+        booking_id = int(parts[3])
+    except Exception:
+        await q.answer("Ошибка ID", show_alert=True)
+        return
+
     action = parts[4]
 
     booking = get_booking(booking_id)
     if not booking:
+        await q.answer()
         await safe_edit_text(q.message, "Запись не найдена.")
         return
+
     if booking.get("client_id") != q.from_user.id:
         await q.answer("Нет доступа", show_alert=True)
         return
+
+    await q.answer()
+
+    # Клиент начал отмену/перенос — считаем это ответом на напоминание
+    booking["client_reminder_responded"] = True
+    booking["client_reminder_response"] = "cancel" if action == "cancel" else "resched"
+    booking["client_reminder_responded_at"] = datetime.now().isoformat(timespec="seconds")
+    await save_bookings_locked()
+
+    # Снимаем будущие клиентские напоминания и повторы
+    remove_client_reminder_jobs(context.job_queue, booking_id)
 
     if action == "cancel":
         kb = [
@@ -2154,6 +2332,7 @@ async def client_cancel_choose(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.user_data["client_resched"] = {"booking_id": booking_id, "offset": 0}
     await client_resched_show_date(q.message, context)
+
 
 async def client_cancel_reason_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -4015,7 +4194,13 @@ async def master_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for b in records:
-        keyboard = [[InlineKeyboardButton("🔁 Перенести", callback_data=f"reschedule_{b['id']}"), InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_master_{b['id']}")]]
+        keyboard = [
+            [InlineKeyboardButton("📨 Отправить напоминание", callback_data=f"master_send_reminder_{b['id']}")],
+            [
+                InlineKeyboardButton("🔁 Перенести", callback_data=f"reschedule_{b['id']}"),
+                InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_master_{b['id']}"),
+            ],
+        ]
         await context.bot.send_message(
             chat_id=master_id,
             text=f"#{b['id']}\n{b['date']} {b['time']}\nУслуга: {b['service_name']}\nКлиент: {format_client(b)}",
@@ -6109,6 +6294,13 @@ def main():
         .pool_timeout(30)
         .build()
     )
+    # ежедневно в 20:00 (можешь поменять)
+    app.job_queue.run_daily(
+        send_master_tomorrow_digest,
+        time=dtime(hour=20, minute=0),
+        name="master_tomorrow_digest",
+    )
+
 
     # DB init (SYNC!)
     init_db()
@@ -6135,6 +6327,7 @@ def main():
     app.add_handler(CallbackQueryHandler(nearest_back, pattern=r"^nearest_back$", block=False))
     app.add_handler(CallbackQueryHandler(nearest_pick, pattern=r"^nearest_pick_", block=False))
     app.add_handler(CallbackQueryHandler(remind_yes, pattern=r"^remind_yes_\d+$", block=False))
+    app.add_handler(CallbackQueryHandler(master_send_reminder, pattern=r"^master_send_reminder_\d+$", block=False))
 
 
     # chat + text router
@@ -6158,6 +6351,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(master_pending, pattern=r"^master_pending$", block=False))
     app.add_handler(CallbackQueryHandler(master_confirmed, pattern=r"^master_confirmed$", block=False))
+    app.add_handler(CallbackQueryHandler(master_send_reminder, pattern=r"^master_send_reminder_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(confirm_booking, pattern=r"^confirm_", block=False))
     app.add_handler(CallbackQueryHandler(cancel_booking, pattern=r"^cancel_booking_", block=False))
 
@@ -6186,7 +6380,6 @@ def main():
     app.add_handler(CallbackQueryHandler(master_cal_day, pattern=r"^mcal_day_\d{4}-\d{2}-\d{2}$", block=False))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$", block=False))
     app.add_handler(CallbackQueryHandler(m_set_photo, pattern="^m_set_photo$", block=False))
-    app.add_handler(CallbackQueryHandler(block_period, pattern=r"^block_period$", block=False))
     app.add_handler(CallbackQueryHandler(block_period, pattern=r"^block_period$", block=False))
     app.add_handler(CallbackQueryHandler(bp_next, pattern=r"^bp_next$", block=False))
     app.add_handler(CallbackQueryHandler(bp_prev, pattern=r"^bp_prev$", block=False))
