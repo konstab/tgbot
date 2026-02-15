@@ -711,14 +711,14 @@ async def send_master_tomorrow_digest(context: ContextTypes.DEFAULT_TYPE):
 
         lines = []
         for b in items:
+            st = "✅ подтвердил" if b.get("client_confirmed") is True else "⏳ ответа нет"
             lines.append(
-                st = "✅ подтвердил" if b.get("client_confirmed") is True else "⏳ ответа нет"
-                lines.append(
+                (
                     f"⏰ {b.get('time')} — {b.get('service_name')}\n"
                     f"👤 {format_client(b)}\n"
                     f"Статус: {st}\n"
-                    f"🆔 #{b.get('id') or b.get('booking_id', '')}".strip()
-                )
+                    f"🆔 #{b.get('id') or b.get('booking_id', '')}"
+                ).strip()
             )
 
         text = "📌 Записи на завтра:\n\n" + "\n\n".join(lines)
