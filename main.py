@@ -398,6 +398,91 @@ def get_days_page(offset: int, days_per_page: int = DAYS_PER_PAGE) -> list[str]:
     start = today + timedelta(days=offset)
     return [(start + timedelta(days=i)).strftime(DATE_FORMAT) for i in range(days_per_page)]
 
+def scan_unblocked_days(master_id: int, start_offset: int, limit: int = MASTER_DAYS_PER_PAGE, scan_cap: int = 365 * 2):
+    """
+    Возвращает (days, end_offset):
+    days — ближайшие limit дней, которые НЕ закрыты целиком (time=None)
+    end_offset — offset последнего проверенного дня (для кнопки ▶)
+    """
+    today = datetime.now().date()
+
+    arr = blocked_slots.get(str(master_id), [])
+    fully_blocked = {
+        b.get("date")
+        for b in arr
+        if isinstance(b, dict) and b.get("date") and b.get("time") is None
+    }
+
+    visible = []
+    offset = int(start_offset)
+    scanned = 0
+
+    while len(visible) < limit and scanned < scan_cap:
+        d = (today + timedelta(days=offset)).strftime(DATE_FORMAT)
+        if d not in fully_blocked:
+            visible.append(d)
+        offset += 1
+        scanned += 1
+
+    end_offset = offset - 1
+    return visible, end_offset
+
+async def m_set_digest_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    mid = q.from_user.id
+    if not is_master(mid):
+        return
+
+    ensure_master_profile(mid)
+    cur = masters_custom[str(mid)].get("tomorrow_digest_time", "20:00")
+
+    kb = [
+        [InlineKeyboardButton("08:00", callback_data="m_set_digest_time_pick_08:00"),
+         InlineKeyboardButton("12:00", callback_data="m_set_digest_time_pick_12:00")],
+        [InlineKeyboardButton("18:00", callback_data="m_set_digest_time_pick_18:00"),
+         InlineKeyboardButton("20:00", callback_data="m_set_digest_time_pick_20:00")],
+        [InlineKeyboardButton("22:00", callback_data="m_set_digest_time_pick_22:00")],
+        [InlineKeyboardButton("⌨ Ввести вручную (HH:MM)", callback_data="m_set_digest_time_pick_manual")],
+        [InlineKeyboardButton("⬅ Назад", callback_data="master_profile")],
+    ]
+
+    await safe_edit_text(q.message, f"Текущее время напоминания: {cur}\n\nВыберите время:", InlineKeyboardMarkup(kb))
+
+
+async def m_set_digest_time_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    mid = q.from_user.id
+    if not is_master(mid):
+        return
+
+    pick = q.data.replace("m_set_digest_time_pick_", "", 1)
+
+    if pick == "manual":
+        context.user_data["digest_time_edit"] = {"mid": mid}
+        await safe_edit_text(q.message, "Введите время в формате HH:MM (например 20:00):")
+        return
+
+    # pick = "HH:MM"
+    if not _is_hhmm(pick):
+        await q.answer("Неверный формат", show_alert=True)
+        return
+
+    ensure_master_profile(mid)
+    masters_custom[str(mid)]["tomorrow_digest_time"] = pick
+    await save_masters_custom_locked()
+
+    await safe_edit_text(q.message, f"✅ Время сохранено: {pick}", InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅ Назад", callback_data="master_profile")]
+    ]))
+
 def scan_available_days(master_id: int, start_offset: int, svc_ids, limit: int = DAYS_PER_PAGE, scan_cap: int = 365 * 2):
     # ✅ нормализация svc_ids
     if svc_ids is None:
@@ -727,6 +812,68 @@ async def send_master_tomorrow_digest(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=mid, text=text)
         except Exception:
             pass
+
+async def send_master_tomorrow_digest_for_master(context: ContextTypes.DEFAULT_TYPE, master_id: int):
+    tomorrow = (datetime.now().date() + timedelta(days=1)).strftime(DATE_FORMAT)
+
+    items = [
+        b for b in bookings
+        if b.get("status") == "CONFIRMED"
+        and b.get("master_id") == master_id
+        and b.get("date") == tomorrow
+    ]
+    if not items:
+        # можно не слать вообще, или слать "завтра нет записей" — как хочешь
+        return
+
+    items.sort(key=lambda x: x.get("time") or "")
+
+    lines = []
+    for b in items:
+        st = "✅ подтвердил" if b.get("client_confirmed") is True else "⏳ ответа нет"
+        lines.append(
+            (
+                f"⏰ {b.get('time')} — {b.get('service_name')}\n"
+                f"👤 {format_client(b)}\n"
+                f"Статус: {st}\n"
+                f"🆔 #{b.get('id')}"
+            ).strip()
+        )
+
+    text = "📌 Записи на завтра:\n\n" + "\n\n".join(lines)
+
+    try:
+        await context.bot.send_message(chat_id=master_id, text=text)
+    except Exception:
+        pass
+
+async def tomorrow_digest_tick(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+    hhmm = now.strftime("%H:%M")
+    today = now.strftime(DATE_FORMAT)
+
+    # мастера, у которых включено и пора отправлять
+    for mid_str, prof in masters_custom.items():
+        try:
+            mid = int(mid_str)
+        except Exception:
+            continue
+
+        if not is_master(mid):
+            continue
+
+        t = (prof.get("tomorrow_digest_time") or "20:00").strip()
+        if t != hhmm:
+            continue
+
+        # чтобы не слать 2 раза в один день
+        if prof.get("tomorrow_digest_last_sent") == today:
+            continue
+
+        # отправляем и фиксируем
+        await send_master_tomorrow_digest_for_master(context, mid)
+        prof["tomorrow_digest_last_sent"] = today
+        await save_masters_custom_locked()
 
 def reminder_delta(cfg: dict) -> timedelta:
     return timedelta(**cfg)
@@ -2707,27 +2854,13 @@ async def back_to_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def show_master_close_day_step(message, master_id: int, offset: int):
-    days = get_days_page(offset, days_per_page=MASTER_DAYS_PER_PAGE)
-
-    # дни, которые закрыты целиком (time=None)
-    arr = blocked_slots.get(str(master_id), [])
-    fully_blocked = {
-        b.get("date")
-        for b in arr
-        if isinstance(b, dict) and b.get("date") and b.get("time") is None
-    }
-
-    # показываем только дни, которые НЕ закрыты целиком
-    visible_days = [d for d in days if d not in fully_blocked]
+    # offset = "с какого дня начинать скан"
+    visible_days, end_offset = await asyncio.to_thread(scan_unblocked_days, master_id, offset, MASTER_DAYS_PER_PAGE)
 
     keyboard = []
-
-    # кнопка "мои блокировки" (чтобы можно было открыть/снять блок)
     keyboard.append([InlineKeyboardButton("📋 Мои блокировки", callback_data="master_blocks")])
     keyboard.append([InlineKeyboardButton("📅 Заблокировать период", callback_data="block_period")])
 
-
-    # список доступных дней
     for d in visible_days:
         keyboard.append([InlineKeyboardButton(d, callback_data=f"choose_block_type_{d}")])
 
@@ -2737,10 +2870,13 @@ async def show_master_close_day_step(message, master_id: int, offset: int):
     ])
     keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="back_to_master")])
 
+    # сохраняем, чтобы next знал, куда прыгать
+    context = None  # тут нет context, поэтому end_offset храним в user_context через update-хендлеры
     text = "Выберите день для закрытия или редактирования:"
     if not visible_days:
-        text += "\n\n(На этой странице все дни уже закрыты целиком — листайте ▶ или откройте «Мои блокировки».)"
+        text += "\n\n(Свободных для выбора дней не найдено. Возможно, всё закрыто надолго.)"
 
+    # ВНИМАНИЕ: end_offset положим в user_context через master_close_day/master_next_days/master_prev_days
     await safe_edit_text(message, text, InlineKeyboardMarkup(keyboard))
 
 async def _render_block_period(message, master_id: int, offset: int, step: str, start_date: str | None):
@@ -2748,7 +2884,8 @@ async def _render_block_period(message, master_id: int, offset: int, step: str, 
     step: "start" или "end"
     start_date: строка DATE_FORMAT, когда step="end"
     """
-    days = get_days_page(offset, days_per_page=MASTER_DAYS_PER_PAGE)
+    days, end_offset = await asyncio.to_thread(scan_unblocked_days, master_id, offset, MASTER_DAYS_PER_PAGE)
+    context_user = None  # тут нет context, end_offset сохраним в context.user_data из bp_next/bp_prev
 
     # если выбираем конец — нельзя выбрать дату раньше старта
     if step == "end" and start_date:
@@ -2915,8 +3052,15 @@ async def master_close_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if not await guard_master(q):
         return
+
     context.user_data["m_day_offset"] = 0
+    context.user_data["m_day_hist"] = []
+    # посчитаем end_offset, чтобы next работал правильно
+    days, end_offset = await asyncio.to_thread(scan_unblocked_days, q.from_user.id, 0, MASTER_DAYS_PER_PAGE)
+    context.user_data["m_day_end_offset"] = end_offset
+
     await show_master_close_day_step(q.message, q.from_user.id, 0)
+
 
 async def master_next_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2926,9 +3070,25 @@ async def master_next_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard_master(q):
         return
 
-    offset = context.user_data.get("m_day_offset", 0) + MASTER_DAYS_PER_PAGE
-    context.user_data["m_day_offset"] = offset
-    await show_master_close_day_step(q.message, q.from_user.id, offset)
+    hist = context.user_data.get("m_day_hist")
+    if not isinstance(hist, list):
+        hist = []
+        context.user_data["m_day_hist"] = hist
+
+    cur = int(context.user_data.get("m_day_offset", 0))
+    hist.append(cur)
+
+    end_offset = context.user_data.get("m_day_end_offset")
+    if end_offset is None:
+        end_offset = cur
+
+    new_offset = int(end_offset) + 1
+    context.user_data["m_day_offset"] = new_offset
+
+    days, new_end = await asyncio.to_thread(scan_unblocked_days, q.from_user.id, new_offset, MASTER_DAYS_PER_PAGE)
+    context.user_data["m_day_end_offset"] = new_end
+
+    await show_master_close_day_step(q.message, q.from_user.id, new_offset)
 
 async def master_prev_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2938,9 +3098,19 @@ async def master_prev_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard_master(q):
         return
 
-    offset = max(0, context.user_data.get("m_day_offset", 0) - MASTER_DAYS_PER_PAGE)
-    context.user_data["m_day_offset"] = offset
-    await show_master_close_day_step(q.message, q.from_user.id, offset)
+    hist = context.user_data.get("m_day_hist")
+    if isinstance(hist, list) and hist:
+        new_offset = int(hist.pop())
+    else:
+        new_offset = 0
+
+    context.user_data["m_day_offset"] = new_offset
+
+    days, new_end = await asyncio.to_thread(scan_unblocked_days, q.from_user.id, new_offset, MASTER_DAYS_PER_PAGE)
+    context.user_data["m_day_end_offset"] = new_end
+
+    await show_master_close_day_step(q.message, q.from_user.id, new_offset)
+
 
 async def choose_block_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -5141,6 +5311,7 @@ async def master_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📞 Контакты", callback_data="m_contacts_menu")],
         [InlineKeyboardButton("🖼 Фото", callback_data="m_set_photo")],          # ✅ добавили
         [InlineKeyboardButton("🗓 Изменить график", callback_data="m_edit_schedule")],
+        [InlineKeyboardButton("⏰ Завтрашние записи: время", callback_data="m_set_digest_time")],
         [InlineKeyboardButton("⬅ Назад", callback_data="back_to_master")],
     ]
 
@@ -5502,6 +5673,36 @@ async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
+    # === РЕЖИМЫ ВВОДА (должны быть ПЕРВЫМИ) ===
+
+    # 0) Защита: relay_messages может прилетать без message (редко, но лучше не падать)
+    if not update.message:
+        return
+
+    # 1) Мастер в режиме ожидания фото профиля: обработаем текст тут (в т.ч. "-" удалить фото)
+    if context.user_data.get("profile_photo_edit"):
+        await m_receive_photo(update, context)
+        return
+
+    # 2) Мастер вводит время дайджеста "завтрашние записи" вручную (HH:MM)
+    st = context.user_data.get("digest_time_edit")
+    if st:
+        mid = st.get("mid")
+        txt = (update.message.text or "").strip()
+
+        if not _is_hhmm(txt):
+            await update.message.reply_text("⚠️ Неверный формат. Введите HH:MM, например 20:00")
+            return
+
+        ensure_master_profile(mid)
+        masters_custom[str(mid)]["tomorrow_digest_time"] = txt
+        await save_masters_custom_locked()
+
+        context.user_data.pop("digest_time_edit", None)
+        await update.message.reply_text(f"✅ Время сохранено: {txt}\nОткройте /master → 👤 Мой профиль.")
+        return
+
+    # === КОНЕЦ РЕЖИМОВ ВВОДА ===
 
     # --------------------------------------------
     # Сбор контактов для клиентов без @username
@@ -6294,13 +6495,12 @@ def main():
         .pool_timeout(30)
         .build()
     )
-    # ежедневно в 20:00 (можешь поменять)
-    app.job_queue.run_daily(
-        send_master_tomorrow_digest,
-        time=dtime(hour=20, minute=0),
-        name="master_tomorrow_digest",
+    app.job_queue.run_repeating(
+        tomorrow_digest_tick,
+        interval=60,   # раз в минуту
+        first=10,      # через 10 секунд после старта
+        name="tomorrow_digest_tick",
     )
-
 
     # DB init (SYNC!)
     init_db()
@@ -6384,6 +6584,8 @@ def main():
     app.add_handler(CallbackQueryHandler(bp_next, pattern=r"^bp_next$", block=False))
     app.add_handler(CallbackQueryHandler(bp_prev, pattern=r"^bp_prev$", block=False))
     app.add_handler(CallbackQueryHandler(bp_pick, pattern=r"^bp_pick_", block=False))
+    app.add_handler(CallbackQueryHandler(m_set_digest_time, pattern=r"^m_set_digest_time$", block=False))
+    app.add_handler(CallbackQueryHandler(m_set_digest_time_pick, pattern=r"^m_set_digest_time_pick_", block=False))
 
     # ловим фото/картинку
     app.add_handler(MessageHandler(filters.PHOTO, m_receive_photo))
