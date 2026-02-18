@@ -903,8 +903,9 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     if not booking or booking.get("status") != "CONFIRMED":
         return
 
-    # Любые клиентские напоминания не шлём, если клиент уже отреагировал
-    if target == "client":
+    # Клиентские авто/повторные напоминания не шлём, если клиент уже отреагировал.
+    # Но manual (по кнопке мастера) разрешаем всегда.
+    if target == "client" and kind != "manual":
         if booking.get("client_confirmed") is True or booking.get("client_reminder_responded") is True:
             return
 
@@ -1078,18 +1079,33 @@ async def master_send_reminder(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.answer("Нет доступа", show_alert=True)
         return
 
-    # если клиент уже ответил — не надо
-    if booking.get("client_confirmed") is True or booking.get("client_reminder_responded") is True:
-        await q.answer("Клиент уже ответил ✅", show_alert=True)
-        return
+    # --- информируем мастера о статусе клиента ---
+    if booking.get("client_confirmed") is True:
+        status_text = "✅ Клиент уже подтвердил («Я приду»)."
+    elif booking.get("client_reminder_responded") is True:
+        status_text = "✅ Клиент уже отреагировал на напоминание (отмена/перенос)."
+    else:
+        status_text = "⏳ Клиент ещё не ответил на напоминание."
 
-    # шлём как kind=manual через send_reminder
+    # --- защита от частых повторов ---
+    # используем поле, которое заполняется в send_reminder при target=client
+    last = booking.get("client_reminder_last_sent_at")
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if (datetime.now() - last_dt).total_seconds() < 120:  # 2 минуты
+                await q.answer(f"{status_text}\n\nСлишком часто. Подождите немного.", show_alert=True)
+                return
+        except Exception:
+            pass
+
+    # шлём как kind=manual через send_reminder (оно само обновит client_reminder_last_sent_at и т.п.)
     fake = type("obj", (), {})()
     fake.data = {"booking_id": booking_id, "target": "client", "kind": "manual"}
     context.job = fake
     await send_reminder(context)
 
-    await q.answer("Отправлено ✅")
+    await q.answer(f"{status_text}\n\nОтправлено ✅", show_alert=True)
 
 def remove_reminders(job_queue, booking_id: int):
     """
