@@ -123,12 +123,10 @@ def get_available_slots(
     if pause < 0:
         pause = 0
 
-    # 3) график мастера
     work = _get_master_schedule(master_id)
     if not work:
         return []
 
-    # дата + weekday
     try:
         day = datetime.strptime(date_str, DATE_FORMAT).date()
     except Exception:
@@ -138,7 +136,6 @@ def get_available_slots(
     if weekday not in work["days"]:
         return []
 
-    # 7) блокировки
     master_blocked = data.blocked_slots.get(str(master_id), [])
     if any(b.get("date") == date_str and b.get("time") is None for b in master_blocked):
         return []
@@ -148,7 +145,7 @@ def get_available_slots(
         for b in master_blocked
         if b.get("date") == date_str and b.get("time")
     }
-    # блокировки считаем интервалами длиной TIME_STEP (чтобы ловить пересечения)
+
     blocked_intervals: list[tuple[int, int]] = []
     for t in blocked_times:
         m = _hhmm_to_min(t)
@@ -156,8 +153,6 @@ def get_available_slots(
             continue
         blocked_intervals.append((m, m + int(TIME_STEP or 0)))
 
-
-    # 4) границы дня в минутах
     start_min = work["start"].hour * 60 + work["start"].minute
     end_min = work["end"].hour * 60 + work["end"].minute
     start_min = _ceil_to_step_min(start_min, TIME_STEP)
@@ -165,13 +160,10 @@ def get_available_slots(
     if start_min >= end_min:
         return []
 
-    # 6) бронь-интервалы (PENDING+CONFIRMED)
     booked_intervals: list[tuple[int, int]] = []
     day_count = 0
 
     for b in data.bookings:
-        if ignore_booking_id is not None and b.get("id") == ignore_booking_id:
-            continue
         if b.get("master_id") != master_id:
             continue
         if b.get("date") != date_str:
@@ -179,61 +171,46 @@ def get_available_slots(
         if b.get("status") not in ("PENDING", "CONFIRMED"):
             continue
 
-        bt = b.get("time")
-        if not bt:
+        # ✅ исключаем ту запись, которую переносим
+        if ignore_booking_id is not None and str(b.get("id")) == str(ignore_booking_id):
             continue
 
-        b_start = _hhmm_to_min(bt)
-        if b_start is None:
-            continue
-
-        try:
-            b_dur = int(b.get("service_duration", 0) or 0)
-        except Exception:
-            b_dur = 0
-        if b_dur <= 0:
-            # fallback (если старые записи без длительности)
-            b_dur = duration
-
-        b_end = b_start + b_dur + pause
-        booked_intervals.append((b_start, b_end))
         day_count += 1
 
-    # daily_limit
-    daily_limit = int(work.get("daily_limit") or 0)
-    if daily_limit > 0 and day_count >= daily_limit:
+        dur = int(b.get("service_duration") or 0)
+        if dur <= 0:
+            dur = _get_service_duration(master_id, b.get("service_id") or 0) or 0
+
+        s = _hhmm_to_min(b.get("time"))
+        if s is None:
+            continue
+
+        e = s + int(dur) + pause
+        booked_intervals.append((s, e))
+
+    if work.get("daily_limit", 0) and day_count >= work["daily_limit"]:
         return []
 
-    # now-фильтр (минимум 2 часа вперёд), если не игнорируем
     now = datetime.now()
     if day < now.date():
         return []
 
-    min_start_min = None
-    if not ignore_min_advance and day == now.date():
-        min_start_min = now.hour * 60 + now.minute + MIN_ADVANCE_MINUTES
+    min_start_min = start_min
+    if day == now.date() and not ignore_min_advance:
+        min_start_min = max(min_start_min, now.hour * 60 + now.minute + int(MIN_ADVANCE_MINUTES or 0))
         min_start_min = _ceil_to_step_min(min_start_min, TIME_STEP)
 
-    available: list[str] = []
+    available = []
+    cur = min_start_min
 
-    # последний старт, чтобы услуга целиком влезла (с паузой)
-    last_start = end_min - (duration + pause)
-    if last_start < start_min:
-        return []
+    while cur + duration <= end_min:
+        slot_end = cur + duration + pause
+        slot_str = _min_to_hhmm(cur)
 
-    cur = start_min
-    while cur <= last_start:
-        if min_start_min is not None and cur < min_start_min:
+        if slot_str in blocked_times:
             cur += TIME_STEP
             continue
 
-        hh = cur // 60
-        mm = cur % 60
-        slot_str = f"{hh:02d}:{mm:02d}"
-
-        slot_end = cur + duration + pause
-
-        # если интервал услуги пересекается с любой блокировкой — слот нельзя
         if any(cur < b_end and slot_end > b_start for b_start, b_end in blocked_intervals):
             cur += TIME_STEP
             continue
@@ -250,7 +227,6 @@ def get_available_slots(
         cur += TIME_STEP
 
     return available
-
 
 def can_book_at_time(
     master_id: int,

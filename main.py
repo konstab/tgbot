@@ -483,7 +483,15 @@ async def m_set_digest_time_pick(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("⬅ Назад", callback_data="master_profile")]
     ]))
 
-def scan_available_days(master_id: int, start_offset: int, svc_ids, limit: int = DAYS_PER_PAGE, scan_cap: int = 365 * 2):
+def scan_available_days(
+    master_id: int,
+    start_offset: int,
+    svc_ids,
+    limit: int = DAYS_PER_PAGE,
+    scan_cap: int = 365 * 2,
+    ignore_min_advance: bool = False,
+    ignore_booking_id: int | None = None,
+):
     # ✅ нормализация svc_ids
     if svc_ids is None:
         svc_ids = []
@@ -514,7 +522,11 @@ def scan_available_days(master_id: int, start_offset: int, svc_ids, limit: int =
             continue
 
         try:
-            slots = get_available_slots(master_id, d, svc_ids)
+            slots = get_available_slots(
+                master_id, d, svc_ids,
+                ignore_min_advance=ignore_min_advance,
+                ignore_booking_id=ignore_booking_id,
+            )
         except Exception:
             slots = []
 
@@ -526,7 +538,6 @@ def scan_available_days(master_id: int, start_offset: int, svc_ids, limit: int =
 
     end_offset = offset - 1
     return available, end_offset
-
 
 def get_next_days(n=100) -> list[str]:
     today = datetime.now().date()
@@ -2570,17 +2581,22 @@ async def client_resched_show_date(message, context: ContextTypes.DEFAULT_TYPE):
         return
 
     offset = int(st.get("offset", 0))
+    booking_id = int(st["booking_id"])
 
     def _calc():
         svc_ids = booking.get("service_ids") or booking["service_id"]
-        return scan_available_days(booking["master_id"], offset, svc_ids, limit=DAYS_PER_PAGE)
+        return scan_available_days(
+            booking["master_id"],
+            offset,
+            svc_ids,
+            limit=DAYS_PER_PAGE,
+            ignore_booking_id=booking_id,   # ✅ ключевое
+        )
 
     available_days, end_offset = await asyncio.to_thread(_calc)
-
     st["end_offset"] = end_offset
 
     kb = [[InlineKeyboardButton(d, callback_data=f"client_resched_date_{d}")] for d in available_days]
-
     kb.append([
         InlineKeyboardButton("◀", callback_data="client_resched_prev"),
         InlineKeyboardButton("▶", callback_data="client_resched_next"),
@@ -2654,13 +2670,20 @@ async def client_resched_choose_date(update: Update, context: ContextTypes.DEFAU
     date = q.data.replace("client_resched_date_", "", 1)
     st["date"] = date
 
-    booking = get_booking(st["booking_id"])
+    booking_id = int(st["booking_id"])
+    booking = get_booking(booking_id)
     if not booking:
         await safe_edit_text(q.message, "Запись не найдена.")
         return
 
     svc_ids = booking.get("service_ids") or booking["service_id"]
-    slots = await asyncio.to_thread(get_available_slots, booking["master_id"], date, svc_ids)
+    slots = await asyncio.to_thread(
+        get_available_slots,
+        booking["master_id"],
+        date,
+        svc_ids,
+        ignore_booking_id=booking_id,  # ✅ ключевое
+    )
 
     if not slots:
         await safe_edit_text(q.message, "На этот день нет свободного времени. Выберите другую дату.")
@@ -2751,25 +2774,51 @@ async def client_resched_choose_time(update: Update, context: ContextTypes.DEFAU
 
     new_time = q.data.replace("client_resched_time_", "", 1)
     new_date = st["date"]
-    booking_id = st["booking_id"]
+
+    try:
+        booking_id = int(st["booking_id"])
+    except Exception:
+        await safe_edit_text(q.message, "Ошибка переноса (ID). Откройте /mybooking заново.")
+        return
 
     old = get_booking(booking_id)
     if not old:
         await safe_edit_text(q.message, "Запись не найдена.")
         return
 
-    svc_ids = old.get("service_ids") or old["service_id"]
-    slots = await asyncio.to_thread(get_available_slots, old["master_id"], new_date, svc_ids)
+    # ✅ защита: переносить может только клиент этой записи
+    if q.from_user.id != old.get("client_id"):
+        await q.answer("Нет доступа", show_alert=True)
+        return
+
+    svc_ids = old.get("service_ids") or old.get("service_id")
+
+    # ✅ КЛЮЧЕВОЕ: исключаем текущую запись из занятости
+    slots = await asyncio.to_thread(
+        get_available_slots,
+        old["master_id"],
+        new_date,
+        svc_ids,
+        ignore_booking_id=booking_id,
+    )
 
     if new_time not in slots:
         await safe_edit_text(q.message, "Это время уже занято. Выберите другое время.")
         return
 
+    # --- дальше логика как у тебя, только чуть дополнили new_booking service_ids ---
     cancel_cleanup_for_booking(booking_id, context)
+
+    # ВАЖНО: у тебя сейчас старая запись отменяется сразу (как было).
     old["status"] = "CANCELLED"
     old["cancelled_by"] = "client"
     old["cancel_reason"] = "Перенос записи"
     await save_bookings_locked()
+
+    # service_id держим как int (на случай если где-то он внезапно list)
+    sid = old.get("service_id")
+    if isinstance(sid, list):
+        sid = int(sid[0]) if sid else 0
 
     new_booking = {
         "id": next_booking_id(),
@@ -2777,7 +2826,8 @@ async def client_resched_choose_time(update: Update, context: ContextTypes.DEFAU
         "client_username": old.get("client_username"),
         "client_full_name": old.get("client_full_name"),
         "master_id": old["master_id"],
-        "service_id": old["service_id"],
+        "service_id": sid,
+        "service_ids": old.get("service_ids") or ([sid] if sid else []),  # ✅ важно для мульти-услуг
         "service_name": old.get("service_name"),
         "service_price": old.get("service_price"),
         "service_duration": old.get("service_duration"),
@@ -2786,6 +2836,7 @@ async def client_resched_choose_time(update: Update, context: ContextTypes.DEFAU
         "status": "PENDING",
         "rescheduled_from": booking_id,
     }
+
     bookings.append(new_booking)
     await save_bookings_locked()
 
@@ -2814,6 +2865,7 @@ async def client_resched_choose_time(update: Update, context: ContextTypes.DEFAU
 
     context.user_data.pop("client_resched", None)
     await safe_edit_text(q.message, "✅ Запрос на перенос отправлен мастеру. Ожидайте подтверждения.")
+
 
 # -----------------------------------------------------------------------------
 # MASTER MENU + закрытие дня/слотов + услуги
@@ -4422,11 +4474,84 @@ async def start_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["reschedule_booking"] = booking_id
+    context.user_data["reschedule_offset"] = 0
+    context.user_data["reschedule_hist"] = []
 
-    days = get_next_days(14)
-    keyboard = [[InlineKeyboardButton(d, callback_data=f"resched_date_{d}")] for d in days]
+    await reschedule_show_date(q.message, context)
 
-    await safe_edit_text(q.message, "Выберите новую дату:", InlineKeyboardMarkup(keyboard))
+async def reschedule_show_date(message, context: ContextTypes.DEFAULT_TYPE):
+    booking_id = context.user_data.get("reschedule_booking")
+    if not booking_id:
+        await safe_edit_text(message, "Сеанс переноса устарел.")
+        return
+
+    booking = get_booking(int(booking_id))
+    if not booking:
+        await safe_edit_text(message, "Запись не найдена.")
+        return
+
+    offset = int(context.user_data.get("reschedule_offset", 0))
+    svc_ids = booking.get("service_ids") or booking["service_id"]
+
+    def _calc():
+        return scan_available_days(
+            booking["master_id"],
+            offset,
+            svc_ids,
+            limit=DAYS_PER_PAGE,
+            ignore_min_advance=True,
+            ignore_booking_id=int(booking_id),  # ✅ исключаем саму запись
+        )
+
+    available_days, end_offset = await asyncio.to_thread(_calc)
+    context.user_data["reschedule_end_offset"] = end_offset
+
+    kb = [[InlineKeyboardButton(d, callback_data=f"resched_date_{d}")] for d in available_days]
+    kb.append([
+        InlineKeyboardButton("◀", callback_data="resched_prev"),
+        InlineKeyboardButton("▶", callback_data="resched_next"),
+    ])
+    kb.append([InlineKeyboardButton("⬅ Назад", callback_data="master_confirmed")])
+
+    if not available_days:
+        await safe_edit_text(message, "Нет доступных дней (листайте ▶).", InlineKeyboardMarkup(kb))
+        return
+
+    await safe_edit_text(message, "Выберите новую дату:", InlineKeyboardMarkup(kb))
+
+async def resched_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    hist = context.user_data.get("reschedule_hist")
+    if not isinstance(hist, list):
+        hist = []
+        context.user_data["reschedule_hist"] = hist
+
+    cur = int(context.user_data.get("reschedule_offset", 0))
+    end_offset = int(context.user_data.get("reschedule_end_offset", cur))
+
+    hist.append(cur)
+    context.user_data["reschedule_offset"] = end_offset + 1
+
+    await reschedule_show_date(q.message, context)
+
+
+async def resched_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    hist = context.user_data.get("reschedule_hist", [])
+    if not hist:
+        context.user_data["reschedule_offset"] = 0
+    else:
+        context.user_data["reschedule_offset"] = hist.pop()
+
+    await reschedule_show_date(q.message, context)
 
 async def reschedule_choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -4435,7 +4560,7 @@ async def reschedule_choose_date(update: Update, context: ContextTypes.DEFAULT_T
     date = q.data.split("_")[2]
     booking_id = context.user_data.get("reschedule_booking")
 
-    booking = get_booking(booking_id)
+    booking = get_booking(int(booking_id)) if booking_id else None
     if not booking:
         await safe_edit_text(q.message, "Запись не найдена.")
         return
@@ -4444,7 +4569,15 @@ async def reschedule_choose_date(update: Update, context: ContextTypes.DEFAULT_T
         await q.answer("Нет доступа", show_alert=True)
         return
 
-    slots = await asyncio.to_thread(get_available_slots, booking["master_id"], date, booking["service_id"], ignore_min_advance=True)
+    svc_ids = booking.get("service_ids") or booking["service_id"]
+    slots = await asyncio.to_thread(
+        get_available_slots,
+        booking["master_id"],
+        date,
+        svc_ids,
+        ignore_min_advance=True,
+        ignore_booking_id=int(booking_id),  # ✅ ключевое
+    )
 
     if not slots:
         await safe_edit_text(q.message, "Нет свободных слотов. Выберите другую дату.")
@@ -4452,35 +4585,116 @@ async def reschedule_choose_date(update: Update, context: ContextTypes.DEFAULT_T
 
     context.user_data["reschedule_date"] = date
     keyboard = [[InlineKeyboardButton(t, callback_data=f"resched_time_{t}")] for t in slots]
+    keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="resched_back")])
+
     await safe_edit_text(q.message, f"Дата {date}. Выберите время:", InlineKeyboardMarkup(keyboard))
+
+async def resched_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    await reschedule_show_date(q.message, context)
 
 async def reschedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not q:
+        return
     await q.answer()
 
-    time = q.data.split("_")[2]
+    # callback_data: resched_time_HH:MM
+    parts = (q.data or "").split("_", 2)
+    if len(parts) < 3:
+        await safe_edit_text(q.message, "Ошибка кнопки времени.")
+        return
+
+    new_time = parts[2]
+
     booking_id = context.user_data.get("reschedule_booking")
     date = context.user_data.get("reschedule_date")
+
+    if not booking_id or not date:
+        await safe_edit_text(q.message, "Сеанс переноса устарел. Откройте перенос заново.")
+        return
+
+    try:
+        booking_id = int(booking_id)
+    except Exception:
+        await safe_edit_text(q.message, "Ошибка переноса (ID).")
+        return
 
     booking = get_booking(booking_id)
     if not booking:
         await safe_edit_text(q.message, "Запись не найдена.")
         return
 
+    # ✅ защита: переносить может только мастер этой записи
+    if q.from_user.id != booking.get("master_id"):
+        await q.answer("Нет доступа", show_alert=True)
+        return
+
+    svc_ids = booking.get("service_ids") or booking.get("service_id")
+
+    # ✅ КЛЮЧЕВОЕ: проверяем доступность, исключая текущую запись
+    slots = await asyncio.to_thread(
+        get_available_slots,
+        booking["master_id"],
+        date,
+        svc_ids,
+        ignore_min_advance=True,
+        ignore_booking_id=booking_id,
+    )
+
+    if new_time not in slots:
+        await safe_edit_text(q.message, "Это время уже занято. Выберите другое.")
+        return
+
+    # переносим
     booking["date"] = date
-    booking["time"] = time
+    booking["time"] = new_time
+
+    # ✅ логично сбросить подтверждение клиента (запись перенесли — пусть подтвердит заново)
+    booking["client_confirmed"] = False
+    booking.pop("client_confirmed_at", None)
+
+    booking["client_reminder_responded"] = False
+    booking.pop("client_reminder_response", None)
+    booking.pop("client_reminder_responded_at", None)
+    booking.pop("client_reminder_first_sent_at", None)
+    booking.pop("client_reminder_last_sent_at", None)
+    booking.pop("client_reminder_last_kind", None)
+    booking["client_reminder_sent_count"] = 0
+
     await save_bookings_locked()
 
     schedule_reminders_for_booking(context.job_queue, booking)
     schedule_followup_for_booking(context.job_queue, booking)
 
-    context.user_data.clear()
+    # ✅ НЕ делаем context.user_data.clear() — это ломает другие режимы
+    for k in (
+        "reschedule_booking",
+        "reschedule_date",
+        "reschedule_offset",
+        "reschedule_hist",
+        "reschedule_end_offset",
+    ):
+        context.user_data.pop(k, None)
+
     await safe_edit_text(q.message, "Запись перенесена ✅")
 
-    await context.bot.send_message(
-        chat_id=booking["client_id"],
-        text=("🔁 Ваша запись была перенесена мастером.\n\n" f"Новая дата: {date}\n" f"Новое время: {time}"),
-    )
+    try:
+        await context.bot.send_message(
+            chat_id=booking["client_id"],
+            text=(
+                "🔁 Ваша запись была перенесена мастером.\n\n"
+                f"Новая дата: {date}\n"
+                f"Новое время: {new_time}\n\n"
+                "Пожалуйста, подтвердите, что вы придёте, когда получите напоминание."
+            ),
+        )
+    except Exception:
+        pass
+
 
 # -----------------------------------------------------------------------------
 # ADMIN: бронирования/статистика/мастера/настройки
@@ -6586,6 +6800,10 @@ def main():
     app.add_handler(CallbackQueryHandler(bp_pick, pattern=r"^bp_pick_", block=False))
     app.add_handler(CallbackQueryHandler(m_set_digest_time, pattern=r"^m_set_digest_time$", block=False))
     app.add_handler(CallbackQueryHandler(m_set_digest_time_pick, pattern=r"^m_set_digest_time_pick_", block=False))
+    app.add_handler(CallbackQueryHandler(resched_prev, pattern=r"^resched_prev$", block=False))
+    app.add_handler(CallbackQueryHandler(resched_next, pattern=r"^resched_next$", block=False))
+    app.add_handler(CallbackQueryHandler(resched_back, pattern=r"^resched_back$", block=False))
+
 
     # ловим фото/картинку
     app.add_handler(MessageHandler(filters.PHOTO, m_receive_photo))
