@@ -988,16 +988,17 @@ async def remind_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    await q.answer()
 
     # remind_yes_<booking_id>
     parts = (q.data or "").split("_")
     if len(parts) < 3:
+        await q.answer("Ошибка кнопки", show_alert=True)
         return
 
     try:
         booking_id = int(parts[2])
     except Exception:
+        await q.answer("Ошибка ID", show_alert=True)
         return
 
     booking = get_booking(booking_id)
@@ -1010,17 +1011,26 @@ async def remind_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Нет доступа", show_alert=True)
         return
 
-    # защита от повторных нажатий
+    # если уже подтверждал — покажем сообщение и на всякий случай уберём кнопки
     if booking.get("client_confirmed") is True:
+        # попробуем убрать кнопки, чтобы клиент не тыкал снова
+        base = (q.message.text or "").strip() if q.message else ""
+        if base and "✅ Отмечено" not in base:
+            base += "\n\n✅ Отмечено: вы придёте."
+            await safe_edit_text(q.message, base, reply_markup=None)
+
         await q.answer("Вы уже подтвердили ✅", show_alert=True)
         return
 
+    # --- отмечаем подтверждение ---
+    now_iso = datetime.now().isoformat(timespec="seconds")
     booking["client_confirmed"] = True
-    booking["client_confirmed_at"] = datetime.now().isoformat(timespec="seconds")
-    await save_bookings_locked()
+    booking["client_confirmed_at"] = now_iso
+
     booking["client_reminder_responded"] = True
     booking["client_reminder_response"] = "yes"
-    booking["client_reminder_responded_at"] = datetime.now().isoformat(timespec="seconds")
+    booking["client_reminder_responded_at"] = now_iso
+
     await save_bookings_locked()
 
     # повторы/клиентские напоминания больше не нужны
@@ -1043,16 +1053,19 @@ async def remind_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     # обновим сообщение клиенту и уберём кнопки
-    new_text = (q.message.text or "").strip()
-    if new_text:
-        new_text += "\n\n✅ Отмечено: вы придёте."
-        await safe_edit_text(q.message, new_text, reply_markup=None)
+    base = (q.message.text or "").strip() if q.message else ""
+    if base:
+        base += "\n\n✅ Отмечено: вы придёте."
+        await safe_edit_text(q.message, base, reply_markup=None)
     else:
-        # на всякий случай (если вдруг нет текста)
-        await context.bot.send_message(
-            chat_id=booking["client_id"],
-            text="✅ Отмечено: вы придёте.",
-        )
+        # на всякий случай
+        try:
+            await context.bot.send_message(chat_id=booking["client_id"], text="✅ Отмечено: вы придёте.")
+        except Exception:
+            pass
+
+    # ✅ ЕДИНСТВЕННЫЙ answer() на успешное нажатие
+    await q.answer("✅ Отмечено")
 
 async def master_send_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
