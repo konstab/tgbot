@@ -375,6 +375,28 @@ def ceil_to_step(dt: datetime, step_min: int) -> datetime:
 def next_booking_id() -> int:
     return max((b.get("id", 0) for b in bookings), default=0) + 1
 
+def _parse_date_any(s: str) -> date | None:
+    """
+    Пытаемся распарсить дату в разных форматах.
+    Важно: DATE_FORMAT берём из config.
+    """
+    if not s:
+        return None
+    for fmt in (DATE_FORMAT, "%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(str(s).strip(), fmt).date()
+        except Exception:
+            continue
+    return None
+
+def _time_key(hhmm: str) -> int:
+    """Для сортировки HH:MM по времени."""
+    try:
+        h, m = str(hhmm).split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return 10**9
+        
 def get_booking(bid: int) -> dict | None:
     return next((b for b in bookings if b.get("id") == bid), None)
 
@@ -3453,7 +3475,10 @@ async def block_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _render_block_view_day(message, master_id: int, date: str):
     arr = blocked_slots.get(str(master_id), [])
     day_blocked = any(b.get("date") == date and b.get("time") is None for b in arr)
-    times = sorted([b.get("time") for b in arr if b.get("date") == date and b.get("time")])
+    times = sorted(
+        [str(b.get("time")) for b in arr if b.get("date") == date and b.get("time")],
+        key=_time_key
+    )
 
     lines = [f"📋 Блокировки на {date}:"]
     if day_blocked:
@@ -3496,32 +3521,70 @@ async def master_blocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     master_id = q.from_user.id
     arr = blocked_slots.get(str(master_id), [])
+    if not isinstance(arr, list):
+        arr = []
 
-    # собираем по датам
-    by_date: dict[str, dict] = {}
+    today = datetime.now().date()
+
+    # 1) чистим прошлые блокировки физически из blocked_slots
+    new_arr = []
+    removed = 0
     for b in arr:
+        if not isinstance(b, dict):
+            continue
+        d = b.get("date")
+        dd = _parse_date_any(str(d) if d else "")
+        # если дату не смогли распарсить — не удаляем (чтобы не потерять данные)
+        if dd is not None and dd < today:
+            removed += 1
+            continue
+        new_arr.append(b)
+
+    if removed > 0:
+        blocked_slots[str(master_id)] = new_arr
+        await save_blocked_locked()
+
+    # 2) собираем по датам (только будущие/сегодня)
+    by_date: dict[str, dict] = {}
+    for b in new_arr:
         if not isinstance(b, dict):
             continue
         d = b.get("date")
         if not d:
             continue
-        rec = by_date.setdefault(d, {"day_blocked": False, "times": []})
+
+        dd = _parse_date_any(str(d))
+        # если дату распарсили и она < сегодня — не показываем (на всякий случай)
+        if dd is not None and dd < today:
+            continue
+
+        rec = by_date.setdefault(str(d), {"day_blocked": False, "times": []})
         if b.get("time") is None:
             rec["day_blocked"] = True
         else:
             rec["times"].append(str(b.get("time")))
 
-    dates = sorted(by_date.keys())
-
-    if not dates:
-        kb = [
-            [InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")]
-        ]
+    if not by_date:
+        kb = [[InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")]]
         await safe_edit_text(q.message, "Блокировок нет ✅", InlineKeyboardMarkup(kb))
         return
 
+    # 3) сортируем по реальной дате
+    # даты, которые не распарсились, отправим в конец
+    sortable = []
+    unsorted = []
+    for d in by_date.keys():
+        dd = _parse_date_any(d)
+        if dd is None:
+            unsorted.append(d)
+        else:
+            sortable.append((dd, d))
+
+    sortable.sort(key=lambda x: x[0])
+    dates_sorted = [d for _, d in sortable] + sorted(unsorted)
+
     keyboard = []
-    for d in dates:
+    for d in dates_sorted:
         rec = by_date[d]
         if rec["day_blocked"]:
             label = f"⛔ {d} (день)"
@@ -3531,7 +3594,16 @@ async def master_blocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton(label, callback_data=f"block_view_{d}")])
 
     keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")])
-    await safe_edit_text(q.message, "📋 Мои блокировки (выберите день):", InlineKeyboardMarkup(keyboard))
+
+    suffix = ""
+    if removed > 0:
+        suffix = f"\n\n🧹 Удалено старых блокировок: {removed}"
+
+    await safe_edit_text(
+        q.message,
+        "📋 Мои блокировки (выберите день):" + suffix,
+        InlineKeyboardMarkup(keyboard),
+    )
 
 async def unblock_day_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
