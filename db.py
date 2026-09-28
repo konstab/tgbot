@@ -20,6 +20,19 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
+
+def backup_database(destination: Path) -> None:
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    source = sqlite3.connect(DB_PATH, timeout=30)
+    target = sqlite3.connect(destination)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(

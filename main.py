@@ -1,4 +1,4 @@
-from db import get_db, init_db, upsert_user
+from db import backup_database, get_db, init_db, upsert_user
 from datetime import datetime, date, timedelta, timezone, time as dtime
 import calendar
 import asyncio
@@ -48,13 +48,13 @@ from data import (
 )
 
 import zipfile
+import tempfile
 from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 BACKUP_DIR = Path(BASE_DIR) / "backups"
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 BACKUP_FILES = [
-    "bot.db",
     "bookings.json",
     "blocked_slots.json",
     "masters_custom.json",
@@ -64,15 +64,27 @@ BACKUP_FILES = [
     "admin_settings.json",
     "clients_custom.json",
 ]
+MAX_BACKUPS = 7
 
 def make_backup_zip() -> Path:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     out = BACKUP_DIR / f"backup_{ts}.zip"
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for fname in BACKUP_FILES:
-            p = Path(BASE_DIR) / fname
-            if p.exists():
-                z.write(p, arcname=fname)
+    try:
+        with tempfile.TemporaryDirectory(prefix=".snapshot_", dir=BACKUP_DIR) as temp_dir:
+            snapshot = Path(temp_dir) / "bot.db"
+            backup_database(snapshot)
+            with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                z.write(snapshot, arcname="storage/bot.db")
+                for fname in BACKUP_FILES:
+                    path = Path(BASE_DIR) / fname
+                    if path.exists():
+                        z.write(path, arcname=fname)
+    except Exception:
+        out.unlink(missing_ok=True)
+        raise
+
+    _prune_backups()
     return out
 # -----------------------------------------------------------------------------
 # ЛОГИ
@@ -6776,10 +6788,25 @@ async def adm_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("admin_add_master", None)
     await safe_edit_text(q.message, "Отменено.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅ В админку", callback_data="admin_back")]]))
 
-def _list_backups(limit: int = 5) -> list[Path]:
+def _prune_backups() -> None:
+    backups = sorted(BACKUP_DIR.glob("backup_*.zip"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for old_backup in backups[MAX_BACKUPS:]:
+        old_backup.unlink(missing_ok=True)
+
+
+def _list_backups(limit: int = MAX_BACKUPS) -> list[Path]:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     zips = sorted(BACKUP_DIR.glob("backup_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
     return zips[:limit]
+
+
+async def scheduled_database_backup(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        path = await asyncio.to_thread(make_backup_zip)
+    except Exception:
+        logger.exception("Ежедневное резервное копирование базы не удалось")
+        return
+    logger.info("Ежедневная резервная копия создана: %s", path)
 
 
 async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6790,7 +6817,7 @@ async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard_admin(q):
         return
 
-    items = _list_backups(5)
+    items = _list_backups(MAX_BACKUPS)
     if items:
         lines = []
         for p in items:
@@ -6890,6 +6917,11 @@ def main():
         interval=60,   # раз в минуту
         first=10,      # через 10 секунд после старта
         name="tomorrow_digest_tick",
+    )
+    app.job_queue.run_daily(
+        scheduled_database_backup,
+        time=dtime(hour=3, minute=0, tzinfo=timezone.utc),
+        name="daily_database_backup",
     )
 
     # DB init (SYNC!)
