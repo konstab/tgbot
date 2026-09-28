@@ -5780,42 +5780,50 @@ async def admin_master_contacts(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["profile_edit"] = {"scope": "admin", "mid": mid, "field": "contacts", "step": "phone"}
     await safe_edit_text(q.message, f"Введите телефон мастера {mid} (или '-' пропустить):")
 
-def _schedule_kb(mid: int, days: list[int], scope: str):
-    # scope: "admin" / "master"
+def _schedule_kb(mid: int, schedule: dict, scope: str):
     pref = "a" if scope == "admin" else "m"
-
-    # toggles
-    row = []
+    days = schedule.get("days", [])
     rows = []
-    for i, wd in enumerate(WEEKDAYS):
-        mark = "✅" if i in days else "▫️"
-        row.append(InlineKeyboardButton(f"{mark} {wd}", callback_data=f"{pref}_sch_tgl_{mid}_{i}"))
-        if len(row) == 3:
+    row = []
+
+    for day, weekday in enumerate(WEEKDAYS):
+        hours = get_work_hours(schedule, day) if day in days else None
+        if hours:
+            label = f"{weekday} {hours[0].strftime('%H:%M')}–{hours[1].strftime('%H:%M')}"
+        elif day in days:
+            label = f"{weekday}: время не задано"
+        else:
+            label = f"{weekday}: выходной"
+        row.append(InlineKeyboardButton(label, callback_data=f"{pref}_sch_day_{mid}_{day}"))
+        if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
 
-    # nav
-    rows.append([
-        InlineKeyboardButton("➡ Далее", callback_data=f"{pref}_sch_next_{mid}"),
-        InlineKeyboardButton("❌ Отмена", callback_data=f"{pref}_sch_cancel_{mid}"),
-    ])
+    limit = schedule.get("daily_limit") or 0
+    limit_label = str(limit) if limit else "без лимита"
+    rows.append([InlineKeyboardButton(f"Лимит записей в день: {limit_label}", callback_data=f"{pref}_sch_limit_{mid}")])
+    rows.append([InlineKeyboardButton("❌ Закрыть", callback_data=f"{pref}_sch_cancel_{mid}")])
     return InlineKeyboardMarkup(rows)
+
 
 async def _schedule_show_days(message, context: ContextTypes.DEFAULT_TYPE):
     st = context.user_data.get("sch_edit")
     if not st:
         return
     mid = st["mid"]
-    days = st.get("days", [])
-    await safe_edit_text(message, f"Выберите рабочие дни мастера {mid}:", _schedule_kb(mid, days, st["scope"]))
+    schedule = masters_custom[str(mid)].get("schedule", {})
+    await safe_edit_text(
+        message,
+        f"График мастера {mid}. Выберите день, чтобы изменить только его:",
+        _schedule_kb(mid, schedule, st["scope"]),
+    )
+
 
 async def _schedule_start(scope: str, mid: int, context: ContextTypes.DEFAULT_TYPE, message):
     ensure_master_profile(mid)
-    sch = masters_custom[str(mid)].get("schedule", {})
-    cur_days = sch.get("days") or []
-    context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "days", "days": list(cur_days)}
+    context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "menu"}
     await _schedule_show_days(message, context)
 
 
@@ -5841,74 +5849,107 @@ async def m_edit_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _schedule_start("master", mid, context, q.message)
 
 
-async def sch_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _schedule_check_access(q, scope: str, mid: int) -> bool:
+    if scope == "admin":
+        return await guard_admin(q)
+    if q.from_user.id != mid:
+        await q.answer("Нет доступа", show_alert=True)
+        return False
+    return True
+
+
+async def sch_day_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
     await q.answer()
 
-    parts = q.data.split("_")  # a/m, sch, tgl, mid, day
+    parts = q.data.split("_")
     scope = "admin" if parts[0] == "a" else "master"
     mid = int(parts[3])
     day = int(parts[4])
-
-    # права
-    if scope == "admin":
-        if not await guard_admin(q):
-            return
-    else:
-        if q.from_user.id != mid:
-            await q.answer("Нет доступа", show_alert=True)
-            return
+    if not await _schedule_check_access(q, scope, mid):
+        return
 
     st = context.user_data.get("sch_edit")
     if not st or st.get("mid") != mid:
-        context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "days", "days": []}
+        context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "menu"}
         st = context.user_data["sch_edit"]
+    st["day"] = day
+    st["step"] = "day_start"
 
-    days = st.get("days", [])
-    if day in days:
-        days.remove(day)
-    else:
-        days.append(day)
-        days.sort()
-    st["days"] = days
+    schedule = masters_custom[str(mid)].get("schedule", {})
+    days = schedule.get("days", [])
+    hours = get_work_hours(schedule, day) if isinstance(days, list) and day in days else None
+    current = f" Сейчас: {hours[0].strftime('%H:%M')}–{hours[1].strftime('%H:%M')}." if hours else ""
+    pref = "a" if scope == "admin" else "m"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Сделать выходным", callback_data=f"{pref}_sch_off_{mid}_{day}")],
+        [InlineKeyboardButton("⬅ К графику", callback_data=f"{pref}_sch_menu_{mid}")],
+    ])
+    await safe_edit_text(q.message, f"{WEEKDAYS[day]}.{current} Введите новое время начала HH:MM:", keyboard)
 
-    await _schedule_show_days(q.message, context)
 
-
-async def sch_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sch_day_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
     await q.answer()
-
-    parts = q.data.split("_")  # a/m, sch, next, mid
+    parts = q.data.split("_")
     scope = "admin" if parts[0] == "a" else "master"
     mid = int(parts[3])
-
-    if scope == "admin":
-        if not await guard_admin(q):
-            return
-    else:
-        if q.from_user.id != mid:
-            await q.answer("Нет доступа", show_alert=True)
-            return
-
-    st = context.user_data.get("sch_edit")
-    if not st or st.get("mid") != mid:
-        await q.answer("Сеанс устарел", show_alert=True)
+    day = int(parts[4])
+    if not await _schedule_check_access(q, scope, mid):
         return
 
-    if not st.get("days"):
-        await q.answer("Выберите хотя бы 1 день", show_alert=True)
+    schedule = masters_custom[str(mid)].setdefault("schedule", {})
+    days = schedule.get("days", [])
+    if not isinstance(days, list):
+        days = []
+    schedule["days"] = [value for value in days if str(value) != str(day)]
+    hours = schedule.get("hours")
+    if isinstance(hours, dict):
+        hours.pop(str(day), None)
+        hours.pop(day, None)
+    await save_masters_custom_locked()
+
+    context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "menu"}
+    await _schedule_show_days(q.message, context)
+
+
+async def sch_limit_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    parts = q.data.split("_")
+    scope = "admin" if parts[0] == "a" else "master"
+    mid = int(parts[3])
+    if not await _schedule_check_access(q, scope, mid):
         return
 
-    st["hours"] = {}
-    st["day_index"] = 0
-    st["step"] = "start"
-    day = st["days"][0]
-    await safe_edit_text(q.message, f"Введите время начала для {WEEKDAYS[day]} в формате HH:MM (например 10:00):")
+    context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "limit"}
+    schedule = masters_custom[str(mid)].get("schedule", {})
+    current = schedule.get("daily_limit") or 0
+    pref = "a" if scope == "admin" else "m"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅ К графику", callback_data=f"{pref}_sch_menu_{mid}")
+    ]])
+    await safe_edit_text(q.message, f"Введите лимит записей в день (сейчас {current}; 0 = без лимита):", keyboard)
+
+
+async def sch_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    parts = q.data.split("_")
+    scope = "admin" if parts[0] == "a" else "master"
+    mid = int(parts[3])
+    if not await _schedule_check_access(q, scope, mid):
+        return
+    context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "menu"}
+    await _schedule_show_days(q.message, context)
 
 
 async def sch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6134,7 +6175,7 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Откройте /admin → 👮 Админы")
         return
 
-    # 0) Редактор графика (admin/master) — текстовые шаги start/end/limit
+    # 0) Редактор графика (admin/master) — изменение одного дня за раз
     st_sch = context.user_data.get("sch_edit")
     if st_sch:
         mid = st_sch["mid"]
@@ -6152,40 +6193,48 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         step = st_sch.get("step")
 
-        if step == "start":
-            if text == "-":
-                await update.message.reply_text("Нельзя пропустить. Введите HH:MM (например 10:00).")
-                return
+        if step == "menu":
+            return
+
+        if step == "day_start":
             if not _is_hhmm(text):
                 await update.message.reply_text("Неверный формат. Введите HH:MM (например 10:00).")
                 return
             st_sch["pending_start"] = text.strip()
-            st_sch["step"] = "end"
-            day = st_sch["days"][st_sch["day_index"]]
-            await update.message.reply_text(f"Теперь введите время окончания для {WEEKDAYS[day]} HH:MM (например 18:00):")
+            st_sch["step"] = "day_end"
+            day = st_sch["day"]
+            await update.message.reply_text(f"Введите время окончания для {WEEKDAYS[day]} HH:MM (например 18:00):")
             return
 
-        if step == "end":
-            if text == "-":
-                await update.message.reply_text("Нельзя пропустить. Введите HH:MM (например 18:00).")
-                return
+        if step == "day_end":
             if not _is_hhmm(text):
                 await update.message.reply_text("Неверный формат. Введите HH:MM (например 18:00).")
                 return
             start = st_sch["pending_start"]
-            if text.strip() <= start:
+            if datetime.strptime(text.strip(), "%H:%M").time() <= datetime.strptime(start, "%H:%M").time():
                 await update.message.reply_text("Время окончания должно быть позже времени начала. Введите HH:MM:")
                 return
-            day = st_sch["days"][st_sch["day_index"]]
-            st_sch["hours"][str(day)] = {"start": start, "end": text.strip()}
-            st_sch["day_index"] += 1
-            if st_sch["day_index"] < len(st_sch["days"]):
-                next_day = st_sch["days"][st_sch["day_index"]]
-                st_sch["step"] = "start"
-                await update.message.reply_text(f"Введите время начала для {WEEKDAYS[next_day]} в формате HH:MM (например 10:00):")
-            else:
-                st_sch["step"] = "limit"
-                await update.message.reply_text("Введите лимит записей в день (0 = без лимита):")
+            day = st_sch["day"]
+            schedule = masters_custom[str(mid)].setdefault("schedule", {})
+            hours = schedule.get("hours")
+            if not isinstance(hours, dict):
+                hours = {}
+                schedule["hours"] = hours
+            hours[str(day)] = {"start": start, "end": text.strip()}
+            days = schedule.get("days")
+            if not isinstance(days, list):
+                days = []
+                schedule["days"] = days
+            if day not in days:
+                days.append(day)
+                days.sort()
+            await save_masters_custom_locked()
+
+            st_sch["step"] = "menu"
+            await update.message.reply_text(
+                f"✅ {WEEKDAYS[day]}: {start}–{text.strip()} сохранено.\n\nВыберите следующий день:",
+                reply_markup=_schedule_kb(mid, schedule, scope),
+            )
             return
 
         if step == "limit":
@@ -6197,25 +6246,15 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Лимит не может быть отрицательным.")
                 return
 
-            ensure_master_profile(mid)
-            masters_custom[str(mid)]["schedule"] = {
-                "days": st_sch.get("days", []),
-                "hours": st_sch.get("hours", {}),
-                "daily_limit": limit,
-            }
+            schedule = masters_custom[str(mid)].setdefault("schedule", {})
+            schedule["daily_limit"] = limit
             await save_masters_custom_locked()
 
-            context.user_data.pop("sch_edit", None)
-            await update.message.reply_text("✅ График сохранён.")
-
-            # вернуть в меню
-            if scope == "admin":
-                # можно просто показать карточку мастера
-                fake = update  # не обязательно
-                # чтобы не усложнять — подсказываем куда нажать:
-                await update.message.reply_text("Откройте /admin → 👥 Мастера → выберите мастера.")
-            else:
-                await update.message.reply_text("Откройте /master → 👤 Мой профиль.")
+            st_sch["step"] = "menu"
+            await update.message.reply_text(
+                "✅ Лимит сохранён.\n\nВыберите день для изменения:",
+                reply_markup=_schedule_kb(mid, schedule, scope),
+            )
             return
 
     # 0.1) Редактор описания/контактов (admin/master)
@@ -6416,7 +6455,7 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Неверный формат. Введите HH:MM (например 18:00).")
                 return
             start = st_add["schedule_pending_start"]
-            if text.strip() <= start:
+            if datetime.strptime(text.strip(), "%H:%M").time() <= datetime.strptime(start, "%H:%M").time():
                 await update.message.reply_text("Время окончания должно быть позже времени начала. Введите HH:MM:")
                 return
             day = st_add["schedule_days"][st_add["schedule_day_index"]]
@@ -7001,8 +7040,10 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_master_about, pattern=r"^admin_master_about_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(admin_master_contacts, pattern=r"^admin_master_contacts_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(admin_master_schedule, pattern=r"^admin_master_schedule_\d+$", block=False))
-    app.add_handler(CallbackQueryHandler(sch_toggle, pattern=r"^(a|m)_sch_tgl_\d+_\d+$", block=False))
-    app.add_handler(CallbackQueryHandler(sch_next, pattern=r"^(a|m)_sch_next_\d+$", block=False))
+    app.add_handler(CallbackQueryHandler(sch_day_edit, pattern=r"^(a|m)_sch_day_\d+_\d+$", block=False))
+    app.add_handler(CallbackQueryHandler(sch_day_off, pattern=r"^(a|m)_sch_off_\d+_\d+$", block=False))
+    app.add_handler(CallbackQueryHandler(sch_limit_edit, pattern=r"^(a|m)_sch_limit_\d+$", block=False))
+    app.add_handler(CallbackQueryHandler(sch_menu, pattern=r"^(a|m)_sch_menu_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(sch_cancel, pattern=r"^(a|m)_sch_cancel_\d+$", block=False))
 
     app.add_handler(CallbackQueryHandler(admin_master_del_prompt, pattern=r"^admin_master_del_\d+$", block=False))
