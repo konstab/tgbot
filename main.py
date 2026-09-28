@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 from telegram import Update
-from schedule import get_available_slots, can_book_at_time
+from schedule import get_available_slots, can_book_at_time, get_work_hours
 from states import States
 from config import (
     TOKEN,
@@ -255,7 +255,7 @@ def _parse_hhmm(s: str):
     except Exception:
         return None
 
-def get_master_schedule_from_data(master_id: int) -> dict | None:
+def get_master_schedule_from_data(master_id: int, weekday: int | None = None) -> dict | None:
     m = masters_custom.get(str(master_id))
     if not isinstance(m, dict):
         return None
@@ -264,10 +264,14 @@ def get_master_schedule_from_data(master_id: int) -> dict | None:
         return None
 
     days = sch.get("days")
-    st = _parse_hhmm(sch.get("start", ""))
-    en = _parse_hhmm(sch.get("end", ""))
+    if not isinstance(days, list) or not days:
+        return None
 
-    if not isinstance(days, list) or st is None or en is None:
+    weekday = days[0] if weekday is None else weekday
+    if weekday not in days:
+        return None
+    work_hours = get_work_hours(sch, weekday)
+    if work_hours is None:
         return None
 
     try:
@@ -275,7 +279,7 @@ def get_master_schedule_from_data(master_id: int) -> dict | None:
     except Exception:
         daily_limit = 0
 
-    return {"days": days, "start": st, "end": en, "daily_limit": daily_limit}
+    return {"days": days, "start": work_hours[0], "end": work_hours[1], "daily_limit": daily_limit}
 
 def get_all_masters() -> dict[int, dict]:
     """
@@ -716,9 +720,25 @@ def format_schedule(s: dict) -> str:
     start = s.get("start") or ""
     end = s.get("end") or ""
     lim = s.get("daily_limit") or 0
-    days_txt = ", ".join(WEEKDAYS[d] for d in days if isinstance(d, int) and 0 <= d <= 6) or "—"
     lim_txt = "без лимита" if not lim else str(lim)
-    if not start or not end or not days:
+    if not days:
+        return "—"
+    hours = s.get("hours")
+    if isinstance(hours, dict) and hours:
+        day_lines = []
+        for day in days:
+            if not isinstance(day, int) or not 0 <= day <= 6:
+                continue
+            day_hours = get_work_hours(s, day)
+            if day_hours:
+                day_lines.append(f"{WEEKDAYS[day]}: {day_hours[0].strftime('%H:%M')}–{day_hours[1].strftime('%H:%M')}")
+            else:
+                day_lines.append(f"{WEEKDAYS[day]}: —")
+        if not day_lines:
+            return "—"
+        return "\n".join(day_lines) + f"\n📌 Лимит/день: {lim_txt}"
+    days_txt = ", ".join(WEEKDAYS[d] for d in days if isinstance(d, int) and 0 <= d <= 6) or "—"
+    if not start or not end:
         return "—"
     return f"{days_txt}\n⏰ {start}–{end}\n📌 Лимит/день: {lim_txt}"
 
@@ -3345,7 +3365,8 @@ def _booked_intervals_for_day(master_id: int, date_s: str) -> list[tuple[int, in
     return intervals
 
 async def _render_block_hours_menu(message, master_id: int, date_s: str, sel: set[str]):
-    work = get_master_schedule_from_data(master_id)
+    day = datetime.strptime(date_s, DATE_FORMAT).date()
+    work = get_master_schedule_from_data(master_id, day.weekday())
     if not work:
         await safe_edit_text(message, "Рабочий график не задан. Задайте график в профиле мастера.")
         return
@@ -3374,7 +3395,6 @@ async def _render_block_hours_menu(message, master_id: int, date_s: str, sel: se
         cur += timedelta(minutes=TIME_STEP)
 
     # --- фильтры: прошлое / уже закрыто / пересечение с записями ---
-    day = datetime.strptime(date_s, DATE_FORMAT).date()
     now = datetime.now().replace(second=0, microsecond=0)
 
     def hhmm_to_min(hhmm: str):
@@ -4003,24 +4023,12 @@ def _weekday_idx(d: date) -> int:
     return d.weekday()  # Mon=0..Sun=6
 
 def _work_minutes_for_day(master_id: int, d: date) -> int:
-    mid = str(master_id)
-    sch = (masters_custom.get(mid, {}) or {}).get("schedule", {}) or {}
-
-    days = sch.get("days", [])
-    if not isinstance(days, list) or _weekday_idx(d) not in days:
+    work = get_master_schedule_from_data(master_id, _weekday_idx(d))
+    if not work:
         return 0
-
-    start = sch.get("start") or ""
-    end = sch.get("end") or ""
-    if not start or not end:
-        return 0
-
-    try:
-        st = datetime.strptime(start, "%H:%M")
-        en = datetime.strptime(end, "%H:%M")
-        return max(0, int((en - st).total_seconds() // 60))
-    except Exception:
-        return 0
+    start_min = work["start"].hour * 60 + work["start"].minute
+    end_min = work["end"].hour * 60 + work["end"].minute
+    return max(0, end_min - start_min)
 
 def _booked_minutes_for_day(master_id: int, day_obj: date) -> tuple[int, int]:
     mins = 0
@@ -4119,7 +4127,7 @@ def _min_enabled_service_id(master_id: int) -> tuple[int, int] | None:
     return best
 
 def _total_start_slots_for_day(master_id: int, d: date, duration_min: int) -> int:
-    sch = get_master_schedule_from_data(master_id)  # :contentReference[oaicite:6]{index=6}
+    sch = get_master_schedule_from_data(master_id, d.weekday())  # :contentReference[oaicite:6]{index=6}
     if not sch:
         return 0
     if d.weekday() not in (sch.get("days") or []):
@@ -5896,8 +5904,11 @@ async def sch_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Выберите хотя бы 1 день", show_alert=True)
         return
 
+    st["hours"] = {}
+    st["day_index"] = 0
     st["step"] = "start"
-    await safe_edit_text(q.message, "Введите время начала в формате HH:MM (например 10:00):")
+    day = st["days"][0]
+    await safe_edit_text(q.message, f"Введите время начала для {WEEKDAYS[day]} в формате HH:MM (например 10:00):")
 
 
 async def sch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6148,9 +6159,10 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not _is_hhmm(text):
                 await update.message.reply_text("Неверный формат. Введите HH:MM (например 10:00).")
                 return
-            st_sch["start"] = text.strip()
+            st_sch["pending_start"] = text.strip()
             st_sch["step"] = "end"
-            await update.message.reply_text("Теперь введите время окончания HH:MM (например 18:00):")
+            day = st_sch["days"][st_sch["day_index"]]
+            await update.message.reply_text(f"Теперь введите время окончания для {WEEKDAYS[day]} HH:MM (например 18:00):")
             return
 
         if step == "end":
@@ -6160,9 +6172,20 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not _is_hhmm(text):
                 await update.message.reply_text("Неверный формат. Введите HH:MM (например 18:00).")
                 return
-            st_sch["end"] = text.strip()
-            st_sch["step"] = "limit"
-            await update.message.reply_text("Введите лимит записей в день (0 = без лимита):")
+            start = st_sch["pending_start"]
+            if text.strip() <= start:
+                await update.message.reply_text("Время окончания должно быть позже времени начала. Введите HH:MM:")
+                return
+            day = st_sch["days"][st_sch["day_index"]]
+            st_sch["hours"][str(day)] = {"start": start, "end": text.strip()}
+            st_sch["day_index"] += 1
+            if st_sch["day_index"] < len(st_sch["days"]):
+                next_day = st_sch["days"][st_sch["day_index"]]
+                st_sch["step"] = "start"
+                await update.message.reply_text(f"Введите время начала для {WEEKDAYS[next_day]} в формате HH:MM (например 10:00):")
+            else:
+                st_sch["step"] = "limit"
+                await update.message.reply_text("Введите лимит записей в день (0 = без лимита):")
             return
 
         if step == "limit":
@@ -6177,8 +6200,7 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ensure_master_profile(mid)
             masters_custom[str(mid)]["schedule"] = {
                 "days": st_sch.get("days", []),
-                "start": st_sch.get("start", ""),
-                "end": st_sch.get("end", ""),
+                "hours": st_sch.get("hours", {}),
                 "daily_limit": limit,
             }
             await save_masters_custom_locked()
@@ -6383,18 +6405,30 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not _is_hhmm(text):
                 await update.message.reply_text("Неверный формат. Введите HH:MM (например 10:00).")
                 return
-            st_add["schedule_start"] = text.strip()
+            st_add["schedule_pending_start"] = text.strip()
             st_add["step"] = "schedule_end"
-            await update.message.reply_text("Введите время окончания HH:MM (например 18:00):")
+            day = st_add["schedule_days"][st_add["schedule_day_index"]]
+            await update.message.reply_text(f"Введите время окончания для {WEEKDAYS[day]} HH:MM (например 18:00):")
             return
 
         if step == "schedule_end":
             if not _is_hhmm(text):
                 await update.message.reply_text("Неверный формат. Введите HH:MM (например 18:00).")
                 return
-            st_add["schedule_end"] = text.strip()
-            st_add["step"] = "daily_limit"
-            await update.message.reply_text("Введите лимит записей в день (0 = без лимита):")
+            start = st_add["schedule_pending_start"]
+            if text.strip() <= start:
+                await update.message.reply_text("Время окончания должно быть позже времени начала. Введите HH:MM:")
+                return
+            day = st_add["schedule_days"][st_add["schedule_day_index"]]
+            st_add["schedule_hours"][str(day)] = {"start": start, "end": text.strip()}
+            st_add["schedule_day_index"] += 1
+            if st_add["schedule_day_index"] < len(st_add["schedule_days"]):
+                next_day = st_add["schedule_days"][st_add["schedule_day_index"]]
+                st_add["step"] = "schedule_start"
+                await update.message.reply_text(f"Введите время начала для {WEEKDAYS[next_day]} HH:MM (например 10:00):")
+            else:
+                st_add["step"] = "daily_limit"
+                await update.message.reply_text("Введите лимит записей в день (0 = без лимита):")
             return
 
         if step == "daily_limit":
@@ -6421,8 +6455,7 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 },
                 "schedule": {
                     "days": st_add.get("schedule_days", []),
-                    "start": st_add.get("schedule_start", ""),
-                    "end": st_add.get("schedule_end", ""),
+                    "hours": st_add.get("schedule_hours", {}),
                     "daily_limit": limit,
                 },
             }
@@ -6687,8 +6720,11 @@ async def adm_add_days_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Выберите хотя бы 1 день", show_alert=True)
         return
 
+    st["schedule_hours"] = {}
+    st["schedule_day_index"] = 0
     st["step"] = "schedule_start"
-    await safe_edit_text(q.message, "Введите время начала HH:MM (например 10:00):")
+    day = st["schedule_days"][0]
+    await safe_edit_text(q.message, f"Введите время начала для {WEEKDAYS[day]} HH:MM (например 10:00):")
 
 async def adm_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query

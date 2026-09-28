@@ -51,6 +51,8 @@ def ensure_master_schema(master_id: int | str) -> dict:
         sch["start"] = ""
     if "end" not in sch:
         sch["end"] = ""
+    if "hours" not in sch or not isinstance(sch.get("hours"), dict):
+        sch["hours"] = {}
     if "daily_limit" not in sch:
         sch["daily_limit"] = 0
 
