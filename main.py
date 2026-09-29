@@ -4585,14 +4585,10 @@ async def master_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 #{b.get('id')} — {client_status}"
         )
         keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"📅 {b.get('date', '-')} {b.get('time', '-')} #{b['id']}",
-                    callback_data=f"mbopen_{b['id']}",
-                ),
-                InlineKeyboardButton("🔁", callback_data=f"reschedule_{b['id']}"),
-                InlineKeyboardButton("❌", callback_data=f"cancel_master_{b['id']}"),
-            ],
+            [InlineKeyboardButton(
+                f"📅 {b.get('date', '-')} {b.get('time', '-')}",
+                callback_data=f"mbopen_{b['id']}",
+            )],
         )
         lines.append("")
 
