@@ -4586,7 +4586,10 @@ async def master_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         keyboard.append(
             [
-                InlineKeyboardButton(f"📨 #{b['id']}", callback_data=f"master_send_reminder_{b['id']}"),
+                InlineKeyboardButton(
+                    f"📅 {b.get('date', '-')} {b.get('time', '-')} #{b['id']}",
+                    callback_data=f"mbopen_{b['id']}",
+                ),
                 InlineKeyboardButton("🔁", callback_data=f"reschedule_{b['id']}"),
                 InlineKeyboardButton("❌", callback_data=f"cancel_master_{b['id']}"),
             ],
@@ -4602,6 +4605,38 @@ async def master_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append(navigation)
 
     await safe_edit_text(q.message, "\n".join(lines).strip(), InlineKeyboardMarkup(keyboard))
+
+async def master_booking_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    master_id = q.from_user.id
+    try:
+        booking_id = int(q.data.rsplit("_", 1)[1])
+    except Exception:
+        return
+
+    booking = get_booking(booking_id)
+    if not booking or booking.get("master_id") != master_id:
+        await safe_edit_text(q.message, "Запись не найдена.")
+        return
+
+    text = (
+        f"📌 Запись #{booking.get('id')}\n\n"
+        f"📅 {booking.get('date', '-')} {booking.get('time', '-')}\n"
+        f"💅 {booking.get('service_name', '-')}\n"
+        f"👤 {format_client(booking)}"
+    )
+    keyboard = [
+        [InlineKeyboardButton("📨 Отправить напоминание", callback_data=f"master_send_reminder_{booking_id}")],
+        [
+            InlineKeyboardButton("🔁 Перенести", callback_data=f"reschedule_{booking_id}"),
+            InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_master_{booking_id}"),
+        ],
+        [InlineKeyboardButton("⬅ К списку", callback_data="master_confirmed")],
+    ]
+    await safe_edit_text(q.message, text, InlineKeyboardMarkup(keyboard))
+
 
 async def cancel_by_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -7024,6 +7059,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(master_pending, pattern=r"^master_pending$", block=False))
     app.add_handler(CallbackQueryHandler(master_confirmed, pattern=r"^master_confirmed(?:_page_\d+)?$", block=False))
+    app.add_handler(CallbackQueryHandler(master_booking_open, pattern=r"^mbopen_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(master_send_reminder, pattern=r"^master_send_reminder_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(confirm_booking, pattern=r"^confirm_", block=False))
     app.add_handler(CallbackQueryHandler(cancel_booking, pattern=r"^cancel_booking_", block=False))
