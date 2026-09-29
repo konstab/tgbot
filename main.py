@@ -1460,8 +1460,10 @@ async def rate_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rating < 1 or rating > 5:
         return
 
+    rated_at = datetime.now().isoformat(timespec="seconds")
     booking["client_rating"] = rating
-    booking["rated_at"] = datetime.now().isoformat(timespec="seconds")
+    booking["rated_at"] = rated_at
+    booking["rating_at"] = rated_at
     await save_bookings_locked()
 
     cfg = get_followup_cfg()
@@ -1477,6 +1479,24 @@ async def rate_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # редактируем сообщение с кнопками оценок
     await safe_edit_text(q.message, text, InlineKeyboardMarkup(kb) if kb else None)
+
+    master_id = booking.get("master_id")
+    if master_id:
+        stars = "⭐️" * rating
+        try:
+            await context.bot.send_message(
+                chat_id=master_id,
+                text=(
+                    "⭐ Новая оценка от клиента\n\n"
+                    f"👤 Клиент: {format_client(booking)}\n"
+                    f"💅 Услуга: {booking.get('service_name', '-')}\n"
+                    f"📅 {booking.get('date', '-')} {booking.get('time', '-')}\n"
+                    f"🆔 Запись #{booking_id}\n\n"
+                    f"Оценка: {rating}/5 {stars}"
+                ),
+            )
+        except Exception:
+            pass
 
 # -----------------------------------------------------------------------------
 # CLIENT FLOW
@@ -4504,11 +4524,20 @@ async def admin_mcal_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def master_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    master_id = q.from_user.id
+    if not is_master(master_id):
+        await q.answer("Нет доступа", show_alert=True)
+        return
     await q.answer()
 
-    master_id = q.from_user.id
-    now = datetime.now()
+    page = 0
+    if q.data.startswith("master_confirmed_page_"):
+        try:
+            page = int(q.data.rsplit("_", 1)[1])
+        except Exception:
+            page = 0
 
+    now = datetime.now()
     records = []
     for b in bookings:
         if b.get("master_id") != master_id:
@@ -4536,21 +4565,43 @@ async def master_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_text(q.message, "Подтверждённых записей нет.")
         return
 
-    for b in records:
-        keyboard = [
-            [InlineKeyboardButton("📨 Отправить напоминание", callback_data=f"master_send_reminder_{b['id']}")],
-            [
-                InlineKeyboardButton("🔁 Перенести", callback_data=f"reschedule_{b['id']}"),
-                InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_master_{b['id']}"),
-            ],
-        ]
-        await context.bot.send_message(
-            chat_id=master_id,
-            text=f"#{b['id']}\n{b['date']} {b['time']}\nУслуга: {b['service_name']}\nКлиент: {format_client(b)}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+    page_size = 8
+    total_pages = max(1, (len(records) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    page_records = records[page * page_size : (page + 1) * page_size]
 
-    await safe_edit_text(q.message, "Ваши записи:")
+    lines = [f"📅 Активные записи ({len(records)})", ""]
+    keyboard = []
+    for b in page_records:
+        if b.get("client_confirmed") is True:
+            client_status = "✅ клиент подтвердил"
+        elif b.get("client_reminder_responded") is True:
+            client_status = "↩️ клиент отреагировал"
+        else:
+            client_status = "⏳ ответа нет"
+        lines.append(
+            f"{b.get('date', '-')} {b.get('time', '-')} — {b.get('service_name', '-')}\n"
+            f"👤 {format_client(b)}\n"
+            f"🆔 #{b.get('id')} — {client_status}"
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton(f"📨 #{b['id']}", callback_data=f"master_send_reminder_{b['id']}"),
+                InlineKeyboardButton("🔁", callback_data=f"reschedule_{b['id']}"),
+                InlineKeyboardButton("❌", callback_data=f"cancel_master_{b['id']}"),
+            ],
+        )
+        lines.append("")
+
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("◀", callback_data=f"master_confirmed_page_{page - 1}"))
+    if page < total_pages - 1:
+        navigation.append(InlineKeyboardButton("▶", callback_data=f"master_confirmed_page_{page + 1}"))
+    if navigation:
+        keyboard.append(navigation)
+
+    await safe_edit_text(q.message, "\n".join(lines).strip(), InlineKeyboardMarkup(keyboard))
 
 async def cancel_by_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -6972,7 +7023,7 @@ def main():
     app.add_handler(CallbackQueryHandler(back_to_master, pattern=r"^back_to_master$", block=False))
 
     app.add_handler(CallbackQueryHandler(master_pending, pattern=r"^master_pending$", block=False))
-    app.add_handler(CallbackQueryHandler(master_confirmed, pattern=r"^master_confirmed$", block=False))
+    app.add_handler(CallbackQueryHandler(master_confirmed, pattern=r"^master_confirmed(?:_page_\d+)?$", block=False))
     app.add_handler(CallbackQueryHandler(master_send_reminder, pattern=r"^master_send_reminder_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(confirm_booking, pattern=r"^confirm_", block=False))
     app.add_handler(CallbackQueryHandler(cancel_booking, pattern=r"^cancel_booking_", block=False))
