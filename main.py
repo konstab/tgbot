@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 from telegram import Update
-from schedule import get_available_slots, can_book_at_time, get_work_hours
+from schedule import get_available_slots, can_book_at_time, get_work_hours, get_extra_day_hours
 from states import States
 from config import (
     TOKEN,
@@ -267,7 +267,7 @@ def _parse_hhmm(s: str):
     except Exception:
         return None
 
-def get_master_schedule_from_data(master_id: int, weekday: int | None = None) -> dict | None:
+def get_master_schedule_from_data(master_id: int, weekday: int | None = None, date_str: str | None = None) -> dict | None:
     m = masters_custom.get(str(master_id))
     if not isinstance(m, dict):
         return None
@@ -276,7 +276,22 @@ def get_master_schedule_from_data(master_id: int, weekday: int | None = None) ->
         return None
 
     days = sch.get("days")
-    if not isinstance(days, list) or not days:
+    if not isinstance(days, list):
+        return None
+
+    try:
+        daily_limit = int(sch.get("daily_limit") or 0)
+    except Exception:
+        daily_limit = 0
+
+    # разово открытый выходной (по конкретной дате)
+    if date_str and weekday is not None and weekday not in days:
+        extra_hours = get_extra_day_hours(sch, date_str)
+        if extra_hours is None:
+            return None
+        return {"days": days, "start": extra_hours[0], "end": extra_hours[1], "daily_limit": daily_limit}
+
+    if not days:
         return None
 
     weekday = days[0] if weekday is None else weekday
@@ -285,11 +300,6 @@ def get_master_schedule_from_data(master_id: int, weekday: int | None = None) ->
     work_hours = get_work_hours(sch, weekday)
     if work_hours is None:
         return None
-
-    try:
-        daily_limit = int(sch.get("daily_limit") or 0)
-    except Exception:
-        daily_limit = 0
 
     return {"days": days, "start": work_hours[0], "end": work_hours[1], "daily_limit": daily_limit}
 
@@ -405,6 +415,15 @@ def _parse_date_any(s: str) -> date | None:
             continue
     return None
 
+WEEKDAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+def fmt_date(date_s) -> str:
+    """'23.11.2026' -> '23.11.2026 (Пн)'. Если дату не распознать — возвращаем как есть."""
+    d = _parse_date_any(date_s) if isinstance(date_s, str) else None
+    if d is None:
+        return str(date_s)
+    return f"{date_s} ({WEEKDAYS_SHORT[d.weekday()]})"
+
 def _time_key(hhmm: str) -> int:
     """Для сортировки HH:MM по времени."""
     try:
@@ -425,7 +444,7 @@ def parse_booking_dt(b: dict) -> datetime | None:
 def booking_label(b: dict) -> str:
     st = b.get("status", "?")
     ico = {"PENDING": "⏳", "CONFIRMED": "✅", "CANCELLED": "❌"}.get(st, "•")
-    return f"{ico} #{b.get('id')} {b.get('date','-')} {b.get('time','-')} — {b.get('service_name','-')}"
+    return f"{ico} #{b.get('id')} {fmt_date(b.get('date','-'))} {b.get('time','-')} — {b.get('service_name','-')}"
 
 def sort_booking_key(b: dict):
     dt = parse_booking_dt(b)
@@ -654,7 +673,7 @@ async def _finalize_pending_booking(update: Update, context: ContextTypes.DEFAUL
             f"Новая заявка #{booking['id']}\n"
             f"👤 Клиент: {format_client(booking)}\n"
             f"Услуга: {booking.get('service_name')}\n"
-            f"Дата: {date_s}\n"
+            f"Дата: {fmt_date(date_s)}\n"
             f"Время: {time_s}"
         ),
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -816,9 +835,16 @@ CLIENT_REPEAT_BEFORE_HOURS = [12, 3]
 def _client_repeat_job_name(booking_id: int, idx: int) -> str:
     return f"client_rep{idx}_{booking_id}"
 
+# --- Надёжность доставки напоминаний ---
+REMINDER_RETRY_DELAY_SEC = 180       # пауза перед повтором при временной ошибке отправки
+REMINDER_MAX_ATTEMPTS = 3            # всего попыток отправки одного напоминания
+NO_REPLY_ALERT_BEFORE_HOURS = 2      # за сколько часов до сеанса предупредить мастера, что клиент молчит
+SHORT_NOTICE_MIN_MINUTES = 60        # "срочное" напоминание не шлём, если до сеанса меньше часа
+SHORT_NOTICE_DELAY_SEC = 15          # через сколько секунд слать срочное напоминание
+
 def remove_client_reminder_jobs(job_queue, booking_id: int):
     """Удаляем только клиентские напоминания по записи: основное + повторы."""
-    names = [f"client_{booking_id}"]
+    names = [f"client_{booking_id}", f"client_retry_{booking_id}", f"client_noreply_{booking_id}"]
     for idx in range(1, len(CLIENT_REPEAT_BEFORE_HOURS) + 1):
         names.append(_client_repeat_job_name(booking_id, idx))
 
@@ -871,7 +897,7 @@ async def send_master_tomorrow_digest(context: ContextTypes.DEFAULT_TYPE):
                 ).strip()
             )
 
-        text = "📌 Записи на завтра:\n\n" + "\n\n".join(lines)
+        text = f"📌 Записи на завтра ({fmt_date(tomorrow)}):\n\n" + "\n\n".join(lines)
 
         try:
             await context.bot.send_message(chat_id=mid, text=text)
@@ -905,7 +931,7 @@ async def send_master_tomorrow_digest_for_master(context: ContextTypes.DEFAULT_T
             ).strip()
         )
 
-    text = "📌 Записи на завтра:\n\n" + "\n\n".join(lines)
+    text = f"📌 Записи на завтра ({fmt_date(tomorrow)}):\n\n" + "\n\n".join(lines)
 
     try:
         await context.bot.send_message(chat_id=master_id, text=text)
@@ -977,7 +1003,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             f"{title}\n\n"
-            f"📅 {booking['date']}\n"
+            f"📅 {fmt_date(booking['date'])}\n"
             f"⏰ {booking['time']}\n"
             f"💅 {booking['service_name']}\n"
             f"📍 Адрес: {addr}\n"
@@ -994,7 +1020,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         text = (
             "⏰ Напоминание о клиенте!\n\n"
             f"👤 Клиент: {format_client(booking)}\n"
-            f"📅 {booking['date']}\n"
+            f"📅 {fmt_date(booking['date'])}\n"
             f"⏰ {booking['time']}\n"
             f"💅 {booking['service_name']}"
         )
@@ -1003,13 +1029,16 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
     except Exception as e:
         print(f"[REMINDER ERROR] booking_id={booking_id} target={target} chat_id={chat_id} err={e}")
-        return
+        await _handle_reminder_failure(context, booking, data, target, kind, e)
+        return False
 
     # фиксируем факт отправки (для статуса мастеру)
     if target == "client":
         now_iso = datetime.now().isoformat(timespec="seconds")
         booking["client_reminder_last_sent_at"] = now_iso
         booking["client_reminder_last_kind"] = str(kind)
+        booking["client_reminder_failed"] = False
+        booking.pop("client_reminder_error", None)
 
         if not booking.get("client_reminder_first_sent_at"):
             booking["client_reminder_first_sent_at"] = now_iso
@@ -1031,12 +1060,111 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
                         "Статус: ⏳ ответа пока нет.\n\n"
                         f"🆔 Запись: #{booking_id}\n"
                         f"👤 Клиент: {format_client(booking)}\n"
-                        f"📅 {booking.get('date')} {booking.get('time')}\n"
+                        f"📅 {fmt_date(booking.get('date'))} {booking.get('time')}\n"
                         f"💅 {booking.get('service_name')}"
                     ),
                 )
             except Exception:
                 pass
+
+    return True
+
+async def _handle_reminder_failure(context, booking: dict, data: dict, target: str, kind, err: Exception):
+    """Временная ошибка — повторяем позже. Постоянная (бот заблокирован и т.п.) — предупреждаем мастера."""
+    booking_id = booking["id"]
+    attempt = int(data.get("attempt") or 1)
+
+    # ручную отправку мастер увидит сразу в ответе на кнопку — без повторов
+    if kind == "manual":
+        return
+
+    temporary = isinstance(err, (telegram.error.TimedOut, telegram.error.NetworkError, telegram.error.RetryAfter))
+    # Forbidden/BadRequest наследуются от TelegramError, но не от NetworkError — это постоянные ошибки
+    if isinstance(err, (telegram.error.Forbidden, telegram.error.BadRequest)):
+        temporary = False
+
+    if temporary and attempt < REMINDER_MAX_ATTEMPTS:
+        delay = REMINDER_RETRY_DELAY_SEC
+        if isinstance(err, telegram.error.RetryAfter):
+            try:
+                delay = max(delay, int(err.retry_after) + 1)
+            except Exception:
+                pass
+        context.job_queue.run_once(
+            send_reminder,
+            when=delay,
+            data={**data, "attempt": attempt + 1},
+            name=f"{target}_retry_{booking_id}",
+        )
+        return
+
+    if target != "client":
+        return
+
+    first_failure = booking.get("client_reminder_failed") is not True
+    booking["client_reminder_failed"] = True
+    booking["client_reminder_failed_at"] = datetime.now().isoformat(timespec="seconds")
+    booking["client_reminder_error"] = str(err)[:200]
+    await save_bookings_locked()
+
+    if first_failure:
+        await _notify_master_reminder_problem(
+            context, booking,
+            "❌ Напоминание НЕ доставлено клиенту.\n"
+            "Возможно, клиент заблокировал бота. Свяжитесь с ним лично.",
+        )
+
+async def _notify_master_reminder_problem(context, booking: dict, headline: str):
+    try:
+        await context.bot.send_message(
+            chat_id=booking["master_id"],
+            text=(
+                f"{headline}\n\n"
+                f"🆔 Запись: #{booking['id']}\n"
+                f"👤 Клиент: {format_client(booking)}\n"
+                f"📅 {fmt_date(booking.get('date'))} {booking.get('time')}\n"
+                f"💅 {booking.get('service_name')}"
+            ),
+        )
+    except Exception:
+        pass
+
+async def send_no_reply_alert(context: ContextTypes.DEFAULT_TYPE):
+    """Незадолго до сеанса: клиент так и не подтвердил — предупреждаем мастера."""
+    data = context.job.data or {}
+    booking = get_booking(data.get("booking_id"))
+    if not booking or booking.get("status") != "CONFIRMED":
+        return
+    if booking.get("client_confirmed") is True or booking.get("client_reminder_responded") is True:
+        return
+    if booking.get("no_reply_alert_sent") is True:
+        return
+
+    if booking.get("client_reminder_failed") is True:
+        reason = "Напоминание не было доставлено, клиент не подтвердил запись."
+    else:
+        reason = "Клиент не подтвердил запись («Я приду»)."
+    await _notify_master_reminder_problem(context, booking, f"⚠️ {reason}\nРекомендуем связаться с клиентом.")
+
+    booking["no_reply_alert_sent"] = True
+    await save_bookings_locked()
+
+def reminder_status_text(b: dict) -> str:
+    """Статус напоминания/подтверждения для мастера."""
+    if b.get("client_confirmed") is True:
+        return "✅ клиент подтвердил"
+    if b.get("client_reminder_responded") is True:
+        return "↩️ клиент отреагировал"
+    if b.get("client_reminder_failed") is True:
+        return "❌ напоминание не доставлено — свяжитесь с клиентом"
+    last = b.get("client_reminder_last_sent_at")
+    if last:
+        try:
+            when = datetime.fromisoformat(last).strftime("%d.%m %H:%M")
+        except Exception:
+            when = "—"
+        return f"📨 доставлено ({when}), ⏳ ответа нет"
+    return "🕒 напоминание ещё не отправлялось"
 
 async def remind_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1097,7 +1225,7 @@ async def remind_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=(
                 "✅ Клиент подтвердил запись (нажал «Я приду»)\n\n"
                 f"👤 Клиент: {format_client(booking)}\n"
-                f"📅 {booking.get('date')}\n"
+                f"📅 {fmt_date(booking.get('date'))}\n"
                 f"⏰ {booking.get('time')}\n"
                 f"💅 {booking.get('service_name')}\n"
                 f"🆔 Запись: #{booking_id}"
@@ -1170,7 +1298,11 @@ async def master_send_reminder(update: Update, context: ContextTypes.DEFAULT_TYP
     fake = type("obj", (), {})()
     fake.data = {"booking_id": booking_id, "target": "client", "kind": "manual"}
     context.job = fake
-    await send_reminder(context)
+    sent = await send_reminder(context)
+
+    if sent is False:
+        await q.answer(f"{status_text}\n\n❌ Не удалось доставить напоминание (клиент мог заблокировать бота). Свяжитесь с ним лично.", show_alert=True)
+        return
 
     await q.answer(f"{status_text}\n\nОтправлено ✅", show_alert=True)
 
@@ -1181,7 +1313,7 @@ def remove_reminders(job_queue, booking_id: int):
     """
     remove_client_reminder_jobs(job_queue, booking_id)
 
-    for name in (f"master_{booking_id}", f"expire_{booking_id}"):
+    for name in (f"master_{booking_id}", f"master_retry_{booking_id}", f"expire_{booking_id}"):
         for job in job_queue.get_jobs_by_name(name):
             job.schedule_removal()
 
@@ -1204,6 +1336,31 @@ def schedule_reminders_for_booking(job_queue: JobQueue, booking: dict):
             data={"booking_id": booking_id, "target": "client"},
             name=f"client_{booking_id}",
         )
+    elif (
+        not booking.get("client_reminder_first_sent_at")
+        and booking.get("client_reminder_failed") is not True
+        and booking.get("client_confirmed") is not True
+        and booking.get("client_reminder_responded") is not True
+        and (booking_dt - now).total_seconds() >= SHORT_NOTICE_MIN_MINUTES * 60
+    ):
+        # запись сделана ближе, чем за основной срок — напоминаем сразу, а не пропускаем
+        job_queue.run_once(
+            send_reminder,
+            when=SHORT_NOTICE_DELAY_SEC,
+            data={"booking_id": booking_id, "target": "client"},
+            name=f"client_{booking_id}",
+        )
+
+    # --- Предупреждение мастеру, если клиент так и не ответил ---
+    if booking.get("no_reply_alert_sent") is not True:
+        alert_delay = (booking_dt - timedelta(hours=NO_REPLY_ALERT_BEFORE_HOURS) - now).total_seconds()
+        if alert_delay > 0:
+            job_queue.run_once(
+                send_no_reply_alert,
+                when=alert_delay,
+                data={"booking_id": booking_id},
+                name=f"client_noreply_{booking_id}",
+            )
     # --- Повторы клиенту (если он не ответил) ---
     base_before_sec = reminder_delta(rcfg["client"]).total_seconds()
 
@@ -1490,7 +1647,7 @@ async def rate_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "⭐ Новая оценка от клиента\n\n"
                     f"👤 Клиент: {format_client(booking)}\n"
                     f"💅 Услуга: {booking.get('service_name', '-')}\n"
-                    f"📅 {booking.get('date', '-')} {booking.get('time', '-')}\n"
+                    f"📅 {fmt_date(booking.get('date', '-'))} {booking.get('time', '-')}\n"
                     f"🆔 Запись #{booking_id}\n\n"
                     f"Оценка: {rating}/5 {stars}"
                 ),
@@ -1732,7 +1889,7 @@ async def show_date_step(message, ctx: dict):
 
     ctx["day_end_offset"] = end_offset  # понадобится для ▶
 
-    keyboard = [[InlineKeyboardButton(d, callback_data=f"date_{d}")] for d in available_days]
+    keyboard = [[InlineKeyboardButton(fmt_date(d), callback_data=f"date_{d}")] for d in available_days]
     keyboard.insert(0, [InlineKeyboardButton("⚡ Ближайшее время", callback_data="nearest_times")])
 
     keyboard.append([
@@ -1811,7 +1968,7 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [[InlineKeyboardButton(t, callback_data=f"time_{t}")] for t in slots]
     keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="back")])
-    await safe_edit_text(q.message, f"Дата: {ctx['date']}\nВыберите время:", InlineKeyboardMarkup(keyboard))
+    await safe_edit_text(q.message, f"Дата: {fmt_date(ctx['date'])}\nВыберите время:", InlineKeyboardMarkup(keyboard))
 
 async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1943,7 +2100,7 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Новая заявка #{booking['id']}\n"
             f"👤 Клиент: {format_client(booking)}\n"
             f"Услуга: {booking['service_name']}\n"
-            f"Дата: {date}\n"
+            f"Дата: {fmt_date(date)}\n"
             f"Время: {selected_time}"
         ),
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1988,7 +2145,7 @@ async def nearest_times(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [
-        [InlineKeyboardButton(f"{d} {t}", callback_data=f"nearest_pick_{d}_{t}")]
+        [InlineKeyboardButton(f"{fmt_date(d)} {t}", callback_data=f"nearest_pick_{d}_{t}")]
         for d, t in nearest
     ]
     keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="nearest_back")])
@@ -2084,7 +2241,7 @@ async def nearest_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Новая заявка #{booking['id']}\n"
             f"👤 Клиент: {format_client(booking)}\n"
             f"Услуга: {booking['service_name']}\n"
-            f"Дата: {date}\n"
+            f"Дата: {fmt_date(date)}\n"
             f"Время: {selected_time}"
         ),
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2129,7 +2286,7 @@ async def my_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 #{b['id']}\n"
             f"Статус: {status}\n"
             f"💅 Услуга: {b.get('service_name','-')}\n"
-            f"📅 Дата: {b.get('date','-')}\n"
+            f"📅 Дата: {fmt_date(b.get('date','-'))}\n"
             f"⏰ Время: {b.get('time','-')}\n"
             f"💰 Цена: {b.get('service_price',0)} ₽"
         )
@@ -2231,7 +2388,7 @@ async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=(
             "✅ Ваша запись подтверждена!\n\n"
             f"💅 Услуга: {booking['service_name']}\n"
-            f"📅 Дата: {booking['date']}\n"
+            f"📅 Дата: {fmt_date(booking['date'])}\n"
             f"⏰ Время: {booking['time']}\n"
             f"📍 Адрес: {addr}\n"
             f"💰 Цена: {booking['service_price']} ₽"
@@ -2244,7 +2401,7 @@ async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Запись подтверждена\n\n"
             f"👤 Клиент: {format_client(booking)}\n"
             f"💅 Услуга: {booking['service_name']}\n"
-            f"📅 {booking['date']} {booking['time']}"
+            f"📅 {fmt_date(booking['date'])} {booking['time']}"
         ),
     )
 
@@ -2281,7 +2438,7 @@ async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=(
                 "❌ Ваша заявка была отклонена мастером.\n\n"
                 f"💅 Услуга: {booking.get('service_name', '')}\n"
-                f"📅 Дата: {booking.get('date', '')}\n"
+                f"📅 Дата: {fmt_date(booking.get('date', ''))}\n"
                 f"⏰ Время: {booking.get('time', '')}"
             ),
         )
@@ -2315,7 +2472,7 @@ async def client_cancel_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     text = (
         f"Запись #{booking_id}\n"
-        f"{booking.get('date','-')} {booking.get('time','-')}\n"
+        f"{fmt_date(booking.get('date','-'))} {booking.get('time','-')}\n"
         f"💅 {booking.get('service_name','-')}\n\n"
         "Что вы хотите сделать?"
     )
@@ -2402,7 +2559,7 @@ async def client_chsvc_render(message, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         f"Текущая запись: #{booking['id']}\n"
-        f"📅 {booking.get('date','-')} ⏰ {booking.get('time','-')}\n"
+        f"📅 {fmt_date(booking.get('date','-'))} ⏰ {booking.get('time','-')}\n"
         f"Сейчас: {booking.get('service_name','-')}\n\n"
         "Выберите новую услугу(и):\n"
     )
@@ -2531,8 +2688,8 @@ async def client_chsvc_apply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         chat_id=master_id,
         text=(
             "✏️ Клиент просит изменить услугу (время НЕ меняется)\n"
-            f"Старая запись: #{booking_id} {old.get('date','-')} {old.get('time','-')} — {old.get('service_name','-')}\n"
-            f"Новая заявка: #{new_booking['id']} {new_booking['date']} {new_booking['time']} — {new_booking['service_name']}\n"
+            f"Старая запись: #{booking_id} {fmt_date(old.get('date','-'))} {old.get('time','-')} — {old.get('service_name','-')}\n"
+            f"Новая заявка: #{new_booking['id']} {fmt_date(new_booking['date'])} {new_booking['time']} — {new_booking['service_name']}\n"
             f"👤 Клиент: {format_client(new_booking)}"
         ),
         reply_markup=InlineKeyboardMarkup(kb),
@@ -2657,7 +2814,7 @@ async def finalize_client_cancel(msg_or_message, context: ContextTypes.DEFAULT_T
                 f"❌ Клиент отменил запись #{booking_id}\n"
                 f"👤 Клиент: {format_client(booking)}\n"
                 f"💅 Услуга: {booking.get('service_name','-')}\n"
-                f"📅 {booking.get('date','-')} {booking.get('time','-')}\n"
+                f"📅 {fmt_date(booking.get('date','-'))} {booking.get('time','-')}\n"
                 f"Причина: {reason_text}"
             ),
         )
@@ -2699,7 +2856,7 @@ async def client_resched_show_date(message, context: ContextTypes.DEFAULT_TYPE):
     available_days, end_offset = await asyncio.to_thread(_calc)
     st["end_offset"] = end_offset
 
-    kb = [[InlineKeyboardButton(d, callback_data=f"client_resched_date_{d}")] for d in available_days]
+    kb = [[InlineKeyboardButton(fmt_date(d), callback_data=f"client_resched_date_{d}")] for d in available_days]
     kb.append([
         InlineKeyboardButton("◀", callback_data="client_resched_prev"),
         InlineKeyboardButton("▶", callback_data="client_resched_next"),
@@ -2795,7 +2952,7 @@ async def client_resched_choose_date(update: Update, context: ContextTypes.DEFAU
     kb = [[InlineKeyboardButton(t, callback_data=f"client_resched_time_{t}")] for t in slots]
     kb.append([InlineKeyboardButton("⬅ Назад", callback_data="client_resched_prev")])
 
-    await safe_edit_text(q.message, f"Дата: {date}\nВыберите новое время:", InlineKeyboardMarkup(kb))
+    await safe_edit_text(q.message, f"Дата: {fmt_date(date)}\nВыберите новое время:", InlineKeyboardMarkup(kb))
 
 def build_services_kb(master_id: int, selected: list[int]) -> InlineKeyboardMarkup:
     services = list_services_for_master(master_id)
@@ -2956,8 +3113,8 @@ async def client_resched_choose_time(update: Update, context: ContextTypes.DEFAU
             chat_id=new_booking["master_id"],
             text=(
                 f"🔁 Клиент просит перенести запись\n"
-                f"Старая: #{booking_id} {old.get('date','-')} {old.get('time','-')}\n"
-                f"Новая заявка: #{new_booking['id']} {new_date} {new_time}\n"
+                f"Старая: #{booking_id} {fmt_date(old.get('date','-'))} {old.get('time','-')}\n"
+                f"Новая заявка: #{new_booking['id']} {fmt_date(new_date)} {new_time}\n"
                 f"👤 Клиент: {format_client(new_booking)}\n"
                 f"💅 Услуга: {new_booking.get('service_name','-')}"
             ),
@@ -3017,7 +3174,7 @@ async def show_master_close_day_step(message, master_id: int, offset: int):
     keyboard.append([InlineKeyboardButton("📅 Заблокировать период", callback_data="block_period")])
 
     for d in visible_days:
-        keyboard.append([InlineKeyboardButton(d, callback_data=f"choose_block_type_{d}")])
+        keyboard.append([InlineKeyboardButton(fmt_date(d), callback_data=f"choose_block_type_{d}")])
 
     keyboard.append([
         InlineKeyboardButton("◀", callback_data="m_prev_days"),
@@ -3062,7 +3219,7 @@ async def _render_block_period(message, master_id: int, offset: int, step: str, 
 
     keyboard = []
     for d in days:
-        keyboard.append([InlineKeyboardButton(d, callback_data=f"bp_pick_{d}")])
+        keyboard.append([InlineKeyboardButton(fmt_date(d), callback_data=f"bp_pick_{d}")])
 
     keyboard.append([
         InlineKeyboardButton("◀", callback_data="bp_prev"),
@@ -3073,7 +3230,7 @@ async def _render_block_period(message, master_id: int, offset: int, step: str, 
     if step == "start":
         text = "📅 Блокировка периода\n\nВыберите ДАТУ НАЧАЛА:"
     else:
-        text = f"📅 Блокировка периода\n\nДата начала: {start_date}\nВыберите ДАТУ КОНЦА:"
+        text = f"📅 Блокировка периода\n\nДата начала: {fmt_date(start_date)}\nВыберите ДАТУ КОНЦА:"
 
     # подсказка, если на странице нет доступных дат (например, фильтр по start_date всё вырезал)
     if not days:
@@ -3192,7 +3349,7 @@ async def bp_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_text(
         q.message,
         f"✅ Период закрыт.\n"
-        f"📅 {start_s} — {date_s}\n"
+        f"📅 {fmt_date(start_s)} — {fmt_date(date_s)}\n"
         f"Дней закрыто: {count}",
         InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 Мои блокировки", callback_data="master_blocks")],
@@ -3280,7 +3437,7 @@ async def choose_block_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🚫 Закрыть весь день", callback_data=f"block_day_{date}")],
         [InlineKeyboardButton("⏰ Закрыть отдельные часы", callback_data=f"block_hours_{date}")],
     ]
-    await safe_edit_text(q.message, f"День {date}: выберите действие", InlineKeyboardMarkup(keyboard))
+    await safe_edit_text(q.message, f"День {fmt_date(date)}: выберите действие", InlineKeyboardMarkup(keyboard))
 
 async def block_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3291,7 +3448,7 @@ async def block_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date = q.data.split("_")[2]
     block_slot(q.from_user.id, date, time=None)
     await save_blocked_locked()   # ✅ ВОТ ЭТО ДОБАВЬ
-    await safe_edit_text(q.message, f"День {date} закрыт ✅")
+    await safe_edit_text(q.message, f"День {fmt_date(date)} закрыт ✅")
 
 async def block_hours_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3398,7 +3555,7 @@ def _booked_intervals_for_day(master_id: int, date_s: str) -> list[tuple[int, in
 
 async def _render_block_hours_menu(message, master_id: int, date_s: str, sel: set[str]):
     day = datetime.strptime(date_s, DATE_FORMAT).date()
-    work = get_master_schedule_from_data(master_id, day.weekday())
+    work = get_master_schedule_from_data(master_id, day.weekday(), date_s)
     if not work:
         await safe_edit_text(message, "Рабочий график не задан. Задайте график в профиле мастера.")
         return
@@ -3406,7 +3563,7 @@ async def _render_block_hours_menu(message, master_id: int, date_s: str, sel: se
     day_blocked, already_blocked = _blocked_times_for_day(master_id, date_s)
     if day_blocked:
         kb = [[InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")]]
-        await safe_edit_text(message, f"День {date_s} закрыт целиком (⛔). Чтобы закрывать отдельные часы — сначала снимите закрытие дня.", InlineKeyboardMarkup(kb))
+        await safe_edit_text(message, f"День {fmt_date(date_s)} закрыт целиком (⛔). Чтобы закрывать отдельные часы — сначала снимите закрытие дня.", InlineKeyboardMarkup(kb))
         return
 
     booked_intervals = _booked_intervals_for_day(master_id, date_s)
@@ -3464,7 +3621,7 @@ async def _render_block_hours_menu(message, master_id: int, date_s: str, sel: se
 
     if not available:
         kb = [[InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")]]
-        await safe_edit_text(message, f"На {date_s} нет доступных стартовых слотов для закрытия (все уже закрыты или заняты).", InlineKeyboardMarkup(kb))
+        await safe_edit_text(message, f"На {fmt_date(date_s)} нет доступных стартовых слотов для закрытия (все уже закрыты или заняты).", InlineKeyboardMarkup(kb))
         return
 
     keyboard = []
@@ -3488,7 +3645,7 @@ async def _render_block_hours_menu(message, master_id: int, date_s: str, sel: se
 
 
     hint = "Выберите несколько слотов и нажмите «Закрыть выбранное»."
-    await safe_edit_text(message, f"Закрытие часов на {date_s}:\n{hint}", InlineKeyboardMarkup(keyboard))
+    await safe_edit_text(message, f"Закрытие часов на {fmt_date(date_s)}:\n{hint}", InlineKeyboardMarkup(keyboard))
 
 
 async def block_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3532,7 +3689,7 @@ async def _render_block_view_day(message, master_id: int, date: str):
         key=_time_key
     )
 
-    lines = [f"📋 Блокировки на {date}:"]
+    lines = [f"📋 Блокировки на {fmt_date(date)}:"]
     if day_blocked:
         lines.append("⛔ День закрыт целиком")
     if times:
@@ -3639,10 +3796,10 @@ async def master_blocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for d in dates_sorted:
         rec = by_date[d]
         if rec["day_blocked"]:
-            label = f"⛔ {d} (день)"
+            label = f"⛔ {fmt_date(d)} (день)"
         else:
             n = len(set(rec["times"]))
-            label = f"⏰ {d} ({n} сл.)"
+            label = f"⏰ {fmt_date(d)} ({n} сл.)"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"block_view_{d}")])
 
     keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="master_close_day")])
@@ -4032,7 +4189,7 @@ async def master_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("✅", callback_data=f"confirm_{b['id']}"), InlineKeyboardButton("❌", callback_data=f"cancel_booking_{b['id']}")]]
         await context.bot.send_message(
             chat_id=master_id,
-            text=f"Заявка #{b['id']}\nКлиент: {format_client(b)}\nДата: {b['date']}\nВремя: {b['time']}",
+            text=f"Заявка #{b['id']}\nКлиент: {format_client(b)}\nДата: {fmt_date(b['date'])}\nВремя: {b['time']}",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
@@ -4055,7 +4212,7 @@ def _weekday_idx(d: date) -> int:
     return d.weekday()  # Mon=0..Sun=6
 
 def _work_minutes_for_day(master_id: int, d: date) -> int:
-    work = get_master_schedule_from_data(master_id, _weekday_idx(d))
+    work = get_master_schedule_from_data(master_id, _weekday_idx(d), d.strftime(DATE_FORMAT))
     if not work:
         return 0
     start_min = work["start"].hour * 60 + work["start"].minute
@@ -4339,7 +4496,7 @@ async def master_cal_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     header = (
-        f"📅 {d.strftime('%d.%m.%Y')}\n"
+        f"📅 {d.strftime('%d.%m.%Y')} ({WEEKDAYS_SHORT[d.weekday()]})\n"
         f"Записей: {cnt}\n"
         f"Занято: {fmt_duration(busy_total)} из {fmt_duration(work)}\n"
     )
@@ -4496,7 +4653,7 @@ async def admin_mcal_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     busy_total = min(work, booked + blocked_min)
 
     header = (
-        f"📅 {d.strftime('%d.%m.%Y')}\n"
+        f"📅 {d.strftime('%d.%m.%Y')} ({WEEKDAYS_SHORT[d.weekday()]})\n"
         f"Записей: {cnt}\n"
         f"Занято: {fmt_duration(busy_total)} из {fmt_duration(work)}\n"
     )
@@ -4573,20 +4730,15 @@ async def master_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"📅 Активные записи ({len(records)})", ""]
     keyboard = []
     for b in page_records:
-        if b.get("client_confirmed") is True:
-            client_status = "✅ клиент подтвердил"
-        elif b.get("client_reminder_responded") is True:
-            client_status = "↩️ клиент отреагировал"
-        else:
-            client_status = "⏳ ответа нет"
+        client_status = reminder_status_text(b)
         lines.append(
-            f"{b.get('date', '-')} {b.get('time', '-')} — {b.get('service_name', '-')}\n"
+            f"{fmt_date(b.get('date', '-'))} {b.get('time', '-')} — {b.get('service_name', '-')}\n"
             f"👤 {format_client(b)}\n"
             f"🆔 #{b.get('id')} — {client_status}"
         )
         keyboard.append(
             [InlineKeyboardButton(
-                f"📅 {b.get('date', '-')} {b.get('time', '-')}",
+                f"📅 {fmt_date(b.get('date', '-'))} {b.get('time', '-')}",
                 callback_data=f"mbopen_{b['id']}",
             )],
         )
@@ -4619,9 +4771,10 @@ async def master_booking_open(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     text = (
         f"📌 Запись #{booking.get('id')}\n\n"
-        f"📅 {booking.get('date', '-')} {booking.get('time', '-')}\n"
+        f"📅 {fmt_date(booking.get('date', '-'))} {booking.get('time', '-')}\n"
         f"💅 {booking.get('service_name', '-')}\n"
-        f"👤 {format_client(booking)}"
+        f"👤 {format_client(booking)}\n"
+        f"🔔 Напоминание: {reminder_status_text(booking)}"
     )
     keyboard = [
         [InlineKeyboardButton("📨 Отправить напоминание", callback_data=f"master_send_reminder_{booking_id}")],
@@ -4656,7 +4809,7 @@ async def cancel_by_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=booking["client_id"],
         text=(
             "❌ Ваша запись была отменена мастером.\n\n"
-            f"{booking['date']} {booking['time']}\n"
+            f"{fmt_date(booking['date'])} {booking['time']}\n"
             f"Услуга: {booking['service_name']}"
         ),
     )
@@ -4709,7 +4862,7 @@ async def reschedule_show_date(message, context: ContextTypes.DEFAULT_TYPE):
     available_days, end_offset = await asyncio.to_thread(_calc)
     context.user_data["reschedule_end_offset"] = end_offset
 
-    kb = [[InlineKeyboardButton(d, callback_data=f"resched_date_{d}")] for d in available_days]
+    kb = [[InlineKeyboardButton(fmt_date(d), callback_data=f"resched_date_{d}")] for d in available_days]
     kb.append([
         InlineKeyboardButton("◀", callback_data="resched_prev"),
         InlineKeyboardButton("▶", callback_data="resched_next"),
@@ -4790,7 +4943,7 @@ async def reschedule_choose_date(update: Update, context: ContextTypes.DEFAULT_T
     keyboard = [[InlineKeyboardButton(t, callback_data=f"resched_time_{t}")] for t in slots]
     keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="resched_back")])
 
-    await safe_edit_text(q.message, f"Дата {date}. Выберите время:", InlineKeyboardMarkup(keyboard))
+    await safe_edit_text(q.message, f"Дата {fmt_date(date)}. Выберите время:", InlineKeyboardMarkup(keyboard))
 
 async def resched_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -4866,6 +5019,10 @@ async def reschedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     booking.pop("client_reminder_first_sent_at", None)
     booking.pop("client_reminder_last_sent_at", None)
     booking.pop("client_reminder_last_kind", None)
+    booking["client_reminder_failed"] = False
+    booking.pop("client_reminder_failed_at", None)
+    booking.pop("client_reminder_error", None)
+    booking["no_reply_alert_sent"] = False
     booking["client_reminder_sent_count"] = 0
 
     await save_bookings_locked()
@@ -4890,7 +5047,7 @@ async def reschedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
             chat_id=booking["client_id"],
             text=(
                 "🔁 Ваша запись была перенесена мастером.\n\n"
-                f"Новая дата: {date}\n"
+                f"Новая дата: {fmt_date(date)}\n"
                 f"Новое время: {new_time}\n\n"
                 "Пожалуйста, подтвердите, что вы придёте, когда получите напоминание."
             ),
@@ -5137,7 +5294,7 @@ async def admin_master_del_do(update: Update, context: ContextTypes.DEFAULT_TYPE
                 chat_id=b["client_id"],
                 text=(
                     "❌ Ваша запись отменена, потому что мастер больше недоступен.\n\n"
-                    f"📅 {b.get('date','-')} {b.get('time','-')}\n"
+                    f"📅 {fmt_date(b.get('date','-'))} {b.get('time','-')}\n"
                     f"💅 {b.get('service_name','-')}\n\n"
                     "Пожалуйста, создайте новую запись через /start."
                 ),
@@ -5315,7 +5472,7 @@ async def admin_booking_open(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🧑‍🔧 Мастер: {master_name} ({b.get('master_id')})\n"
         f"💅 Услуга: {b.get('service_name','-')}\n"
         f"💰 Цена: {b.get('service_price',0)} ₽\n"
-        f"📅 {b.get('date','-')} {b.get('time','-')}\n"
+        f"📅 {fmt_date(b.get('date','-'))} {b.get('time','-')}\n"
         f"👤 Клиент: {format_client(b)}\n"
         f"⭐ Оценка клиента: {rating_line}\n"
     )
@@ -5358,7 +5515,7 @@ async def admin_booking_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             text=(
                 "✅ Ваша запись подтверждена администратором!\n\n"
                 f"💅 {b.get('service_name','-')}\n"
-                f"📅 {b.get('date','-')} {b.get('time','-')}\n"
+                f"📅 {fmt_date(b.get('date','-'))} {b.get('time','-')}\n"
                 f"💰 {b.get('service_price',0)} ₽"
                 f"📍 Адрес: {addr}\n"
             ),
@@ -5369,7 +5526,7 @@ async def admin_booking_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         await context.bot.send_message(
             chat_id=b["master_id"],
-            text=f"✅ Администратор подтвердил запись #{bid}\n{b.get('date','-')} {b.get('time','-')}\nКлиент: {format_client(b)}",
+            text=f"✅ Администратор подтвердил запись #{bid}\n{fmt_date(b.get('date','-'))} {b.get('time','-')}\nКлиент: {format_client(b)}",
         )
     except Exception:
         pass
@@ -5897,6 +6054,7 @@ def _schedule_kb(mid: int, schedule: dict, scope: str):
 
     limit = schedule.get("daily_limit") or 0
     limit_label = str(limit) if limit else "без лимита"
+    rows.append([InlineKeyboardButton("➕ Открыть выходной (1 раз)", callback_data=f"{pref}_sch_xlist_{mid}_0")])
     rows.append([InlineKeyboardButton(f"Лимит записей в день: {limit_label}", callback_data=f"{pref}_sch_limit_{mid}")])
     rows.append([InlineKeyboardButton("❌ Закрыть", callback_data=f"{pref}_sch_cancel_{mid}")])
     return InlineKeyboardMarkup(rows)
@@ -6065,6 +6223,239 @@ async def sch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await master_profile(update, context)
 
 # -----------------------------------------------------------------------------
+# Разовое открытие выходного дня (недельный график не меняется)
+# Хранится в schedule["extra_days"] = {"ДД.ММ.ГГГГ": {"start": "HH:MM", "end": "HH:MM"}}
+# -----------------------------------------------------------------------------
+EXTRA_DAYS_HORIZON = 90
+EXTRA_DAYS_PER_PAGE = 8
+
+def _parse_sch_extra_cb(data: str) -> tuple[str, int, str]:
+    # (a|m)_sch_<action>_<mid>[_<arg>]
+    parts = data.split("_")
+    scope = "admin" if parts[0] == "a" else "master"
+    return scope, int(parts[3]), (parts[4] if len(parts) > 4 else "")
+
+async def _extra_access(q, scope: str, mid: int) -> bool:
+    if not await _schedule_check_access(q, scope, mid):
+        return False
+    if scope == "master" and not is_master(mid):
+        await q.answer("Нет доступа", show_alert=True)
+        return False
+    return True
+
+def _extra_days_map(mid: int) -> dict:
+    sch = ensure_master_profile(mid).get("schedule")
+    extra = sch.get("extra_days") if isinstance(sch, dict) else None
+    return extra if isinstance(extra, dict) else {}
+
+def _extra_day_problem(mid: int, date_s: str) -> str | None:
+    """Причина, почему день нельзя открыть разово (None — можно)."""
+    d = _parse_date_any(date_s)
+    if d is None:
+        return "Некорректная дата"
+    if d < datetime.now().date():
+        return "Этот день уже прошёл"
+    sch = ensure_master_profile(mid).get("schedule", {})
+    days = sch.get("days") if isinstance(sch, dict) else None
+    if isinstance(days, list) and d.weekday() in days:
+        return "Этот день и так рабочий по графику"
+    if _is_day_blocked(mid, d.strftime(DATE_FORMAT)):
+        return "День закрыт блокировкой. Сначала снимите её в «Мои блокировки»"
+    return None
+
+def _default_open_hours(mid: int) -> tuple[str, str] | None:
+    """Обычные часы работы мастера (первый рабочий день графика) — для быстрой кнопки."""
+    sch = ensure_master_profile(mid).get("schedule", {})
+    days = sch.get("days") if isinstance(sch, dict) else None
+    if not isinstance(days, list):
+        return None
+    for wd in sorted(x for x in days if isinstance(x, int)):
+        h = get_work_hours(sch, wd)
+        if h:
+            return h[0].strftime("%H:%M"), h[1].strftime("%H:%M")
+    return None
+
+def _store_extra_day(mid: int, date_s: str, start: str, end: str) -> str:
+    """Записывает разовый день в память (сохранение в БД — снаружи). Возвращает нормализованную дату."""
+    ds = _parse_date_any(date_s).strftime(DATE_FORMAT)
+    sch = ensure_master_profile(mid).setdefault("schedule", {})
+    extra = sch.get("extra_days")
+    if not isinstance(extra, dict):
+        extra = {}
+        sch["extra_days"] = extra
+    today = datetime.now().date()
+    for k in list(extra.keys()):
+        kd = _parse_date_any(k)
+        if kd is not None and kd < today:
+            extra.pop(k, None)
+    extra[ds] = {"start": start, "end": end}
+    return ds
+
+async def _render_extra_list(message, scope: str, mid: int, page: int):
+    pref = "a" if scope == "admin" else "m"
+    sch = ensure_master_profile(mid).get("schedule", {})
+    days = sch.get("days") if isinstance(sch, dict) else None
+    days = days if isinstance(days, list) else []
+    extra = _extra_days_map(mid)
+    today = datetime.now().date()
+
+    opened = []
+    for k, v in extra.items():
+        kd = _parse_date_any(k)
+        if kd is not None and kd >= today and isinstance(v, dict):
+            opened.append((kd, k, v))
+    opened.sort(key=lambda x: x[0])
+
+    candidates = []
+    for i in range(EXTRA_DAYS_HORIZON):
+        d = today + timedelta(days=i)
+        ds = d.strftime(DATE_FORMAT)
+        if d.weekday() in days or ds in extra or _is_day_blocked(mid, ds):
+            continue
+        candidates.append(ds)
+
+    pages = max(1, (len(candidates) + EXTRA_DAYS_PER_PAGE - 1) // EXTRA_DAYS_PER_PAGE)
+    page = min(max(0, page), pages - 1)
+    chunk = candidates[page * EXTRA_DAYS_PER_PAGE:(page + 1) * EXTRA_DAYS_PER_PAGE]
+
+    kb = []
+    for _, k, v in opened:
+        kb.append([InlineKeyboardButton(
+            f"❌ Закрыть {fmt_date(k)} {v.get('start')}–{v.get('end')}",
+            callback_data=f"{pref}_sch_xdel_{mid}_{k}",
+        )])
+    for ds in chunk:
+        kb.append([InlineKeyboardButton(fmt_date(ds), callback_data=f"{pref}_sch_xpick_{mid}_{ds}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀", callback_data=f"{pref}_sch_xlist_{mid}_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶", callback_data=f"{pref}_sch_xlist_{mid}_{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("⬅ К графику", callback_data=f"{pref}_sch_menu_{mid}")])
+
+    text = (
+        "➕ Разовое открытие выходного\n\n"
+        "Выберите выходной день, который нужно открыть один раз — клиенты смогут на него записаться. "
+        "Недельный график не изменится.\n"
+    )
+    if opened:
+        text += "\nОткрыто разово (нажмите, чтобы закрыть обратно):\n"
+    if not candidates:
+        text += f"\nНет выходных дней для открытия в ближайшие {EXTRA_DAYS_HORIZON} дней."
+    await safe_edit_text(message, text, InlineKeyboardMarkup(kb))
+
+
+async def sch_extra_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    scope, mid, arg = _parse_sch_extra_cb(q.data)
+    if not await _extra_access(q, scope, mid):
+        return
+    await q.answer()
+
+    context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "menu"}
+    await _render_extra_list(q.message, scope, mid, int(arg or 0))
+
+
+async def sch_extra_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    scope, mid, date_s = _parse_sch_extra_cb(q.data)
+    if not await _extra_access(q, scope, mid):
+        return
+
+    problem = _extra_day_problem(mid, date_s)
+    if problem:
+        await q.answer(problem, show_alert=True)
+        return
+    await q.answer()
+
+    pref = "a" if scope == "admin" else "m"
+    context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "extra_hours", "extra_date": date_s}
+
+    kb = []
+    default = _default_open_hours(mid)
+    if default:
+        kb.append([InlineKeyboardButton(
+            f"Как обычно: {default[0]}–{default[1]}",
+            callback_data=f"{pref}_sch_xdef_{mid}_{date_s}",
+        )])
+    kb.append([InlineKeyboardButton("⬅ Назад", callback_data=f"{pref}_sch_xlist_{mid}_0")])
+
+    await safe_edit_text(
+        q.message,
+        f"Открыть {fmt_date(date_s)} один раз.\n\n"
+        "Введите рабочие часы в формате ЧЧ:ММ-ЧЧ:ММ (например 10:00-18:00)"
+        + (" или нажмите кнопку ниже:" if default else ":"),
+        InlineKeyboardMarkup(kb),
+    )
+
+
+async def _finish_extra_open(mid: int, scope: str, date_s: str, start: str, end: str) -> tuple[str, InlineKeyboardMarkup]:
+    ds = _store_extra_day(mid, date_s, start, end)
+    await save_masters_custom_locked()
+    sch = ensure_master_profile(mid).get("schedule", {})
+    text = (
+        f"✅ {fmt_date(ds)} открыт на один раз: {start}–{end}.\n"
+        "Клиенты уже могут записаться. Недельный график не изменён."
+    )
+    return text, _schedule_kb(mid, sch, scope)
+
+
+async def sch_extra_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    scope, mid, date_s = _parse_sch_extra_cb(q.data)
+    if not await _extra_access(q, scope, mid):
+        return
+
+    problem = _extra_day_problem(mid, date_s)
+    default = _default_open_hours(mid)
+    if problem or not default:
+        await q.answer(problem or "Не удалось определить обычные часы — введите время вручную", show_alert=True)
+        return
+    await q.answer()
+
+    text, kb = await _finish_extra_open(mid, scope, date_s, default[0], default[1])
+    context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "menu"}
+    await safe_edit_text(q.message, text, kb)
+
+
+async def sch_extra_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    scope, mid, date_s = _parse_sch_extra_cb(q.data)
+    if not await _extra_access(q, scope, mid):
+        return
+
+    active = [
+        b for b in bookings
+        if b.get("master_id") == mid and b.get("date") == date_s and b.get("status") in ("PENDING", "CONFIRMED")
+    ]
+    if active:
+        await q.answer(
+            f"На этот день есть записи ({len(active)}). Сначала отмените или перенесите их.",
+            show_alert=True,
+        )
+        return
+    await q.answer()
+
+    extra = _extra_days_map(mid)
+    if date_s in extra:
+        extra.pop(date_s, None)
+        await save_masters_custom_locked()
+
+    context.user_data["sch_edit"] = {"scope": scope, "mid": mid, "step": "menu"}
+    await _render_extra_list(q.message, scope, mid, 0)
+
+# -----------------------------------------------------------------------------
 # BACK (клиентский визард назад) — исправлено: показывает всех мастеров
 # -----------------------------------------------------------------------------
 async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6125,7 +6516,7 @@ async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         slots = get_available_slots(master_id, date, service_id)
         keyboard = [[InlineKeyboardButton(t, callback_data=f"time_{t}")] for t in slots]
         keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="back")])
-        await safe_edit_text(q.message, f"Дата: {date}\nВыберите время:", InlineKeyboardMarkup(keyboard))
+        await safe_edit_text(q.message, f"Дата: {fmt_date(date)}\nВыберите время:", InlineKeyboardMarkup(keyboard))
         return
 
 # -----------------------------------------------------------------------------
@@ -6288,6 +6679,32 @@ async def relay_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         step = st_sch.get("step")
 
         if step == "menu":
+            return
+
+        if step == "extra_hours":
+            parts_h = [p.strip() for p in text.replace("–", "-").replace("—", "-").split("-")]
+            if len(parts_h) != 2 or not all(_is_hhmm(p) for p in parts_h):
+                await update.message.reply_text("Неверный формат. Введите ЧЧ:ММ-ЧЧ:ММ (например 10:00-18:00).")
+                return
+            start_t = datetime.strptime(parts_h[0], "%H:%M")
+            end_t = datetime.strptime(parts_h[1], "%H:%M")
+            if end_t <= start_t:
+                await update.message.reply_text("Время окончания должно быть позже начала. Введите ЧЧ:ММ-ЧЧ:ММ:")
+                return
+
+            date_s = st_sch.get("extra_date")
+            problem = _extra_day_problem(mid, date_s) if date_s else "День не выбран"
+            if problem:
+                st_sch["step"] = "menu"
+                await update.message.reply_text(f"⚠️ {problem}")
+                return
+
+            reply_text, reply_kb = await _finish_extra_open(
+                mid, scope, date_s, start_t.strftime("%H:%M"), end_t.strftime("%H:%M")
+            )
+            st_sch["step"] = "menu"
+            st_sch.pop("extra_date", None)
+            await update.message.reply_text(reply_text, reply_markup=reply_kb)
             return
 
         if step == "day_start":
@@ -7160,6 +7577,10 @@ def main():
     app.add_handler(CallbackQueryHandler(sch_limit_edit, pattern=r"^(a|m)_sch_limit_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(sch_menu, pattern=r"^(a|m)_sch_menu_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(sch_cancel, pattern=r"^(a|m)_sch_cancel_\d+$", block=False))
+    app.add_handler(CallbackQueryHandler(sch_extra_list, pattern=r"^(a|m)_sch_xlist_\d+_\d+$", block=False))
+    app.add_handler(CallbackQueryHandler(sch_extra_pick, pattern=r"^(a|m)_sch_xpick_\d+_\d{2}\.\d{2}\.\d{4}$", block=False))
+    app.add_handler(CallbackQueryHandler(sch_extra_default, pattern=r"^(a|m)_sch_xdef_\d+_\d{2}\.\d{2}\.\d{4}$", block=False))
+    app.add_handler(CallbackQueryHandler(sch_extra_delete, pattern=r"^(a|m)_sch_xdel_\d+_\d{2}\.\d{2}\.\d{4}$", block=False))
 
     app.add_handler(CallbackQueryHandler(admin_master_del_prompt, pattern=r"^admin_master_del_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(admin_master_del_do, pattern=r"^admin_master_del_do_\d+$", block=False))

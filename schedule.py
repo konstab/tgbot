@@ -33,6 +33,27 @@ def get_work_hours(schedule: dict, weekday: int) -> tuple[time, time] | None:
     return start, end
 
 
+def get_extra_day_hours(schedule: dict, date_str: str) -> tuple[time, time] | None:
+    """Часы разово открытого выходного дня (schedule["extra_days"][дата]) или None."""
+    extra = schedule.get("extra_days") if isinstance(schedule, dict) else None
+    item = extra.get(date_str) if isinstance(extra, dict) else None
+    if not isinstance(item, dict):
+        return None
+    start = _parse_hhmm(item.get("start"))
+    end = _parse_hhmm(item.get("end"))
+    if start is None or end is None or start >= end:
+        return None
+    return start, end
+
+
+def get_day_work_hours(schedule: dict, date_str: str, weekday: int) -> tuple[time, time] | None:
+    """Рабочие часы на конкретную дату: обычный график, иначе разово открытый день."""
+    days = schedule.get("days")
+    if isinstance(days, list) and weekday in days:
+        return get_work_hours(schedule, weekday)
+    return get_extra_day_hours(schedule, date_str)
+
+
 def _get_master_schedule(master_id: int) -> Optional[dict]:
     m = data.ensure_master_schema(master_id)  # <-- гарантирует поля
     ov = data.master_overrides.get(str(master_id), {})
@@ -148,9 +169,7 @@ def get_available_slots(
         return []
 
     weekday = day.weekday()
-    if weekday not in work["days"]:
-        return []
-    work_hours = get_work_hours(work["schedule"], weekday)
+    work_hours = get_day_work_hours(work["schedule"], date_str, weekday)
     if work_hours is None:
         return []
 
@@ -305,7 +324,8 @@ def can_book_at_time(
         return False
 
     weekday = day.weekday()
-    if weekday not in work["days"]:
+    work_hours = get_day_work_hours(work["schedule"], date_str, weekday)
+    if work_hours is None:
         return False
 
     # целый день закрыт
@@ -328,8 +348,8 @@ def can_book_at_time(
         blocked_intervals.append((m, m + int(TIME_STEP or 0)))
 
 
-    start_min = work["start"].hour * 60 + work["start"].minute
-    end_min = work["end"].hour * 60 + work["end"].minute
+    start_min = work_hours[0].hour * 60 + work_hours[0].minute
+    end_min = work_hours[1].hour * 60 + work_hours[1].minute
     start_min = _ceil_to_step_min(start_min, TIME_STEP)
     if start_min >= end_min:
         return False
